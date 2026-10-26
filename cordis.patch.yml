@@ -1,0 +1,10 @@
+# Bundle patch for dsh-model-rotation. One Host row (tools/llm/agents) plus one
+# Client row (dsh-client-modules scans the package's dsh.client declaration and
+# bundles exports["./client"] into the browser boot graph). The name field is
+# the package name for both rows; the Host row resolves package.json main.
+- insert:
+    - id: dsh-model-rotation
+      name: dsh-model-rotation
+      inject: [llm, agents, sessionProjections]
+    - id: dsh-model-rotation-client
+      name: dsh-model-rotation

@@ -1,0 +1,6 @@
+# git ignored files
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
