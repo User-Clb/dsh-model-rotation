@@ -291,24 +291,84 @@ function findInOrder(selection) {
   );
 }
 
-/** Next row in the rotation after the given selection (wraps around). */
-function nextRow(currentSelection) {
-  if (config.order.length === 0) return undefined;
-  const index = currentSelection === undefined ? -1 : findInOrder(currentSelection);
-  return config.order[(index + 1) % config.order.length];
-}
 
-/** Install one durable model selection exactly like the official RPC does. */
+/**
+ * Install one model selection through the session-controller's official path
+ * (selectForNextRequest): it appends the durable `model/selection` event AND
+ * updates the controller's in-memory picked selection.
+ *
+ * Writing only the durable event (the previous implementation) advanced the
+ * projection while the controller's captured `picked` stayed on the FAILED
+ * model — so prompt assembly kept reporting the old route, consumeSelection()
+ * never matched the new header, and the very next assembly reverted to the
+ * failed model. That is exactly the "rotated model doesn't actually work"
+ * symptom: it rotated away again immediately.
+ *
+ * NO liveness precheck here, by design: every candidate must go through the
+ * complete failure-detection flow on its own — the official dsh-llm-retry
+ * budget (all retries with exponential backoff up to the 10 s cap, 429 /
+ * quota / rate-limit envelopes included) runs per provider BEFORE the failure
+ * ever reaches this plugin, and only a budget-exhausted model-side failure
+ * rotates onward. Catalog-based pre-skipping (the previous lenient check)
+ * judged models without a single real request and skipped actually-working
+ * ones; a candidate is now judged dead only by its own request outcome.
+ *
+ * The one silent adjustment: an unsupported stored reasoningEffort is degraded
+ * to the adapter default when capabilities are resolvable — retrying an
+ * effort-id mismatch is never a model outage.
+ */
 async function applySelection(ctx, agent, row) {
+  let effort = row.reasoningEffort;
+  if (effort !== undefined) {
+    try {
+      const info = await ctx.llm.resolveModelInfo(row.provider, row.model);
+      const reasoning = info?.reasoning;
+      if (reasoning !== undefined && !reasoning.efforts.some((candidate) => candidate.id === effort)) {
+        effort = reasoning.defaultEffort;
+      }
+    } catch {
+      // Unknown capabilities — keep the stored effort; the request decides.
+    }
+  }
   const selection = {
     provider: row.provider,
     model: row.model,
-    ...(row.reasoningEffort === undefined ? {} : { reasoningEffort: row.reasoningEffort }),
+    ...(effort === undefined ? {} : { reasoningEffort: effort }),
   };
-  // Same durable event the session-controller writes on session.selectModel —
-  // the projection advances, the composer seat and /model popup follow.
+  const controller = ctx.get?.('sessionController');
+  const agentsController = controller?.agents;
+  if (agentsController !== undefined && typeof agentsController.selectForNextRequest === 'function') {
+    agentsController.selectForNextRequest(agent, selection);
+    return selection;
+  }
+  // Fallback (controller absent): durable event only — still better than nothing.
   agent.session.append('model/selection', selection);
   return selection;
+}
+
+/**
+ * Rotate to the next model in list order. No candidate filtering: every model
+ * gets the full request + retry flow; a candidate that exhausts its own retry
+ * budget rotates past on its next failure.
+ */
+async function rotateToNext(ctx, agent, currentIndex) {
+  const orderLength = config.order.length;
+  for (let offset = 1; offset <= orderLength; offset += 1) {
+    const row = config.order[(currentIndex + offset) % orderLength];
+    const isSameRoute = currentIndex >= 0
+      && row.provider === config.order[currentIndex].provider
+      && row.model === config.order[currentIndex].model;
+    if (isSameRoute) continue;
+    try {
+      const selection = await applySelection(ctx, agent, row);
+      return { row, selection };
+    } catch (error) {
+      ctx.logger?.warn?.(
+        `[model-rotation] candidate ${row.provider}/${row.model} failed to install: ${String(error instanceof Error ? error.message : error).slice(0, 160)}`,
+      );
+    }
+  }
+  return undefined;
 }
 
 function registerRecovery(ctx) {
@@ -318,32 +378,27 @@ function registerRecovery(ctx) {
     if (!isModelSideFailure(failure)) return next();
     const orderLength = config.order.length;
     if (orderLength === 0) return next();
+    if (orderLength === 1) return next(); // nothing to rotate to; avoid a pointless validation call
     const current = durableSelection(ctx, agent);
-    const row = nextRow(current);
-    if (row === undefined) return next();
-    // Already on this exact route (single-row list matching the current model)
-    // would loop forever: only rotate when the next row differs.
-    if (
-      current !== undefined &&
-      current.provider === row.provider &&
-      current.model === row.model
-    ) {
-      return next();
-    }
+    const currentIndex = current === undefined ? -1 : findInOrder(current);
     if (!cycleBudgetAvailable(orderLength)) {
       ctx.logger?.warn?.(
         `[model-rotation] rotation stopped: ${config.maxCycles} full cycles within ${Math.round(config.cycleWindowMs / 60000)} min — all models unavailable short-term`,
       );
       return next();
     }
-    const selection = await applySelection(ctx, agent, row);
+    const rotated = await rotateToNext(ctx, agent, currentIndex);
+    if (rotated === undefined) {
+      ctx.logger?.warn?.('[model-rotation] no valid rotation candidate (all rejected by resolveCallConfig)');
+      return next();
+    }
     recordSwitch();
     ctx.logger?.warn?.(
-      `[model-rotation] model failure (${failure?.code ?? 'UNKNOWN'}: ${String(failure?.message ?? '').slice(0, 160)}) — rotated to ${selection.provider}/${selection.model} (step ${payload.turn}/${payload.step})`,
+      `[model-rotation] model failure (${failure?.code ?? 'UNKNOWN'}: ${String(failure?.message ?? '').slice(0, 160)}) — rotated to ${rotated.selection.provider}/${rotated.selection.model} (step ${payload.turn}/${payload.step})`,
     );
-    // Instruct the loop to re-run the failed step; the request rebuilds over
-    // the same durable history and the agent/request listener below pins the
-    // new route onto the reconstructed request.
+    // Instruct the loop to re-run the failed step; the loop re-enters
+    // prepareRequest(), whose agent/request waterfall re-resolves the route —
+    // and the controller's in-memory selection now matches the durable one.
     return { kind: 'retry' };
   });
 }
