@@ -1027,7 +1027,10 @@ window.__ModuleLoader__.load({
      *
      *   - the card reserves that strip with `margin-top`, so nothing overlaps
      *     and nothing is pushed off-screen (a flex item's margin is inside the
-     *     parent's content box, so an overflow-hidden ancestor cannot clip it);
+     *     parent's content box, so an overflow-hidden ancestor cannot clip it).
+     *     `margin-top` is badge height (20px) plus a breathing gap above the
+     *     badge (14px), so the pill does not butt against the transcript's
+     *     action row directly above it;
      *   - the badge itself is absolutely positioned `top: -20px` from the
      *     card's top edge — exactly its own height — so its BOTTOM EDGE lands
      *     on the card's top border.
@@ -1043,7 +1046,7 @@ window.__ModuleLoader__.load({
       const style = document.createElement("style");
       style.id = BADGE_STYLE_ID;
       style.textContent =
-        "[data-composer-card][data-dsh-model-badge]{margin-top:22px !important}";
+        "[data-composer-card][data-dsh-model-badge]{margin-top:34px !important}";
       (document.head ?? document.documentElement).appendChild(style);
     }
 
