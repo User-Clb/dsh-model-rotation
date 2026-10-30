@@ -438,7 +438,8 @@ const effortCompatCache = new Map(); // key: provider\u0000model → Set(support
 
 async function supportedEfforts(ctx, provider, model) {
   const key = `${provider}\u0000${model}`;
-  if (effortCompatCache.has(key)) return effortCompatCache.get(key);
+  const cached = effortCompatCache.get(key);
+  if (cached !== undefined) return cached;
   let result = 'unknown';
   try {
     const info = await ctx.llm.resolveModelInfo(provider, model);
@@ -451,7 +452,9 @@ async function supportedEfforts(ctx, provider, model) {
     // must STRIP the effort rather than pick a default.
     if (reasoning === undefined) result = new Set();
   } catch {
-    // capabilities unknown — leave 'unknown', callers pass the effort through
+    // Transient capability failure: do NOT cache 'unknown' — a poisoned cache
+    // would pass incompatible efforts through forever.
+    return 'unknown';
   }
   effortCompatCache.set(key, result);
   return result;
@@ -475,19 +478,30 @@ async function compatEffort(ctx, route) {
   if (supported.size === 0) {
     // Non-reasoning model: drop the effort entirely.
     const { reasoningEffort: _dropped, ...stripped } = route;
+    ctx.logger?.warn?.(
+      `[model-rotation] effort "${route.reasoningEffort}" not supported by ${route.provider}/${route.model} (non-reasoning) — stripped`,
+    );
     return stripped;
   }
   try {
     const info = await ctx.llm.resolveModelInfo(route.provider, route.model);
     const defaultEffort = info?.reasoning?.defaultEffort;
     if (defaultEffort !== undefined && supported.has(defaultEffort)) {
+      ctx.logger?.warn?.(
+        `[model-rotation] effort "${route.reasoningEffort}" not supported by ${route.provider}/${route.model} — degraded to adapter default "${defaultEffort}"`,
+      );
       return { ...route, reasoningEffort: defaultEffort };
     }
   } catch {
     /* fall through */
   }
   const first = supported.values().next();
-  if (!first.done) return { ...route, reasoningEffort: first.value };
+  if (!first.done) {
+    ctx.logger?.warn?.(
+      `[model-rotation] effort "${route.reasoningEffort}" not supported by ${route.provider}/${route.model} — degraded to "${first.value}"`,
+    );
+    return { ...route, reasoningEffort: first.value };
+  }
   return route;
 }
 
