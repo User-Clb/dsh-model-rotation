@@ -177,9 +177,21 @@ function normalizeCatalog(input) {
   return groups;
 }
 
+/** Per-session enablement overrides: sessionId → true/false. */
+function normalizeSessionOverrides(input) {
+  if (input === null || typeof input !== 'object') return {};
+  const out = {};
+  for (const [sessionId, enabled] of Object.entries(input)) {
+    if (typeof sessionId !== 'string' || sessionId.length === 0) continue;
+    if (typeof enabled === 'boolean') out[sessionId] = enabled;
+  }
+  return out;
+}
+
 function normalize(input = {}) {
   return {
     enabled: input.enabled === true,
+    sessionOverrides: normalizeSessionOverrides(input.sessionOverrides),
     order: normalizeOrder(input.order),
     maxCycles: clampInt(input.maxCycles, 1, 20, DEFAULTS.maxCycles),
     cycleWindowMs: clampInt(input.cycleWindowMs, 60_000, 24 * 60 * 60 * 1000, DEFAULTS.cycleWindowMs),
@@ -226,34 +238,78 @@ function persistConfig(next) {
 let config = loadConfig();
 
 /**
- * Ring of switch timestamps, one entry per rotation step. Length grows to
- * `order.length * maxCycles` before the guard fires; trimmed to keep memory flat.
+ * Ring of switch timestamps per SESSION, one entry per rotation step. Sessions
+ * have independent cycle budgets — one session exhausting its window must not
+ * stop another session's rotation. Trimmed to keep memory flat.
  */
-let switchLog = [];
+const switchLogs = new Map(); // sessionId → number[]
 
-function resetSwitchLog() {
-  switchLog = [];
+function sessionSwitchLog(sessionId) {
+  let log = switchLogs.get(sessionId);
+  if (log === undefined) {
+    log = [];
+    switchLogs.set(sessionId, log);
+  }
+  return log;
+}
+
+function resetSwitchLog(sessionId) {
+  if (sessionId === undefined || sessionId === null || sessionId === '') {
+    switchLogs.clear();
+    return;
+  }
+  switchLogs.delete(sessionId);
 }
 
 /**
- * Whether one more full cycle is allowed. A full cycle = `order.length`
- * consecutive switches. We count completed cycles inside the window; if the
- * number of complete cycles already at or above `maxCycles` within the window,
- * stop rotating.
+ * Whether one more full cycle is allowed FOR THIS SESSION. A full cycle =
+ * `order.length` consecutive switches. We count completed cycles inside the
+ * window; if the number of complete cycles already at or above `maxCycles`
+ * within the window, stop rotating.
  */
-function cycleBudgetAvailable(orderLength) {
+function cycleBudgetAvailable(sessionId, orderLength) {
   if (orderLength <= 0) return false;
   const windowStart = Date.now() - config.cycleWindowMs;
-  const recent = switchLog.filter((t) => t >= windowStart);
+  const recent = sessionSwitchLog(sessionId).filter((t) => t >= windowStart);
   const completedCycles = Math.floor(recent.length / orderLength);
   return completedCycles < config.maxCycles;
 }
 
-function recordSwitch() {
+function recordSwitch(sessionId) {
   const now = Date.now();
-  switchLog.push(now);
+  const log = sessionSwitchLog(sessionId);
+  log.push(now);
   const keep = Math.max(config.order.length * (config.maxCycles + 1), 64);
-  if (switchLog.length > keep) switchLog = switchLog.slice(-keep);
+  if (log.length > keep) switchLogs.set(sessionId, log.slice(-keep));
+}
+
+/** Cycle count for display — per session when known, aggregate otherwise. */
+function cycleCountFor(sessionId) {
+  const windowStart = Date.now() - config.cycleWindowMs;
+  const logs = sessionId !== undefined && sessionId !== null && sessionId !== ''
+    ? [sessionSwitchLog(sessionId)]
+    : [...switchLogs.values()];
+  const recent = logs.reduce((sum, log) => sum + log.filter((t) => t >= windowStart).length, 0);
+  return Math.floor(recent / Math.max(config.order.length, 1));
+}
+
+/**
+ * Per-session enablement. The rotation list is shared, but whether rotation is
+ * ON — and how far it has cycled — belongs to each conversation. Overrides
+ * persist in the config file under `sessionOverrides`; absent entry falls
+ * back to the global `enabled` (default off).
+ */
+function sessionEnabledFor(sessionId) {
+  if (sessionId === undefined || sessionId === null || sessionId === '') return config.enabled;
+  return config.sessionOverrides?.[sessionId] ?? config.enabled;
+}
+
+function setSessionEnabled(sessionId, enabled) {
+  const overrides = { ...(config.sessionOverrides ?? {}) };
+  if (typeof sessionId !== 'string' || sessionId.length === 0) return config;
+  if (enabled === null || enabled === undefined) delete overrides[sessionId];
+  else overrides[sessionId] = enabled === true;
+  return { ...config, sessionOverrides: overrides };
 }
 
 /**
@@ -401,16 +457,18 @@ async function rotateToNext(ctx, agent, currentIndex) {
 function registerRecovery(ctx) {
   ctx.on('agent/request-error', async (payload, next) => {
     const { agent, failure } = payload ?? {};
-    if (!config.enabled || agent === undefined) return next();
+    // Per-session enablement: agent.id IS the session id (agents.get(sessionId) === agent).
+    const sessionId = agent?.id;
+    if (!sessionEnabledFor(sessionId) || agent === undefined) return next();
     if (!isModelSideFailure(failure)) return next();
     const orderLength = config.order.length;
     if (orderLength === 0) return next();
     if (orderLength === 1) return next(); // nothing to rotate to; avoid a pointless validation call
     const current = durableSelection(ctx, agent);
     const currentIndex = current === undefined ? -1 : findInOrder(current);
-    if (!cycleBudgetAvailable(orderLength)) {
+    if (!cycleBudgetAvailable(sessionId, orderLength)) {
       ctx.logger?.warn?.(
-        `[model-rotation] rotation stopped: ${config.maxCycles} full cycles within ${Math.round(config.cycleWindowMs / 60000)} min — all models unavailable short-term`,
+        `[model-rotation] rotation stopped for session ${sessionId}: ${config.maxCycles} full cycles within ${Math.round(config.cycleWindowMs / 60000)} min — all models unavailable short-term`,
       );
       return next();
     }
@@ -419,7 +477,7 @@ function registerRecovery(ctx) {
       ctx.logger?.warn?.('[model-rotation] no valid rotation candidate (all rejected by resolveCallConfig)');
       return next();
     }
-    recordSwitch();
+    recordSwitch(sessionId);
     ctx.logger?.warn?.(
       `[model-rotation] model failure (${failure?.code ?? 'UNKNOWN'}: ${String(failure?.message ?? '').slice(0, 160)}) — rotated to ${rotated.selection.provider}/${rotated.selection.model} (step ${payload.turn}/${payload.step})`,
     );
@@ -582,15 +640,16 @@ async function buildCatalog(llm) {
   return groups;
 }
 
-function publicConfig() {
+function publicConfig(sessionId) {
   return {
     ...config,
-    switchLog: switchLog.map((t) => new Date(t).toISOString()),
-    cycleCount: (() => {
-      const windowStart = Date.now() - config.cycleWindowMs;
-      const recent = switchLog.filter((t) => t >= windowStart);
-      return Math.floor(recent.length / Math.max(config.order.length, 1));
-    })(),
+    switchLog: (sessionId !== undefined && sessionId !== null && sessionId !== ''
+      ? sessionSwitchLog(sessionId)
+      : [...switchLogs.values()].flat()
+    ).map((t) => new Date(t).toISOString()),
+    cycleCount: cycleCountFor(sessionId),
+    // The enablement state that matters to THIS session (override or global).
+    enabled: sessionEnabledFor(sessionId),
   };
 }
 
@@ -681,32 +740,49 @@ async function handleRpc(request) {
     return failure(body.rpcId, 'invalid-request', 'payload must be { endpoint, payload }');
   }
   try {
+    // Every endpoint accepts an optional sessionId: when present, enablement
+    // and the cycle log are scoped to THAT conversation (per-session state),
+    // while the list/items and window settings stay globally shared.
+    const sessionId = typeof wrapped.payload?.sessionId === 'string' ? wrapped.payload.sessionId : undefined;
     if (wrapped.endpoint === 'get') {
-      return success(body.rpcId, publicConfig());
+      return success(body.rpcId, publicConfig(sessionId));
     }
     if (wrapped.endpoint === 'catalog') {
       const llm = ctxRef?.llm;
       const catalog = llm === undefined ? config.catalog : await buildCatalog(llm);
       config = normalize({ ...config, catalog });
       persistConfig(config);
-      return success(body.rpcId, { catalog, ...publicConfig() });
+      return success(body.rpcId, { catalog, ...publicConfig(sessionId) });
     }
     if (wrapped.endpoint === 'set') {
-      const patch = wrapped.payload ?? {};
+      const patch = { ...(wrapped.payload ?? {}) };
+      delete patch.sessionId;
+      // Per-session enablement goes through setSession, never into the
+      // global config.enabled.
+      if (Object.hasOwn(patch, 'sessionEnabled')) {
+        const next = setSessionEnabled(sessionId, patch.sessionEnabled);
+        delete patch.sessionEnabled;
+        config = normalize({ ...next, ...patch });
+        persistConfig(config);
+        return success(body.rpcId, publicConfig(sessionId));
+      }
       const next = normalize({ ...config, ...patch });
       // Reorder/same length? keep the rotation pointer consistent: nothing to
-      // do, the order is the state. Reset the cycle log only when the list
-      // membership actually changed, so edits keep their budget.
+      // do, the order is the state. Reset cycle logs only when the list
+      // membership actually changed, so edits keep their budget. The log is
+      // per session — reset every session's budget together with the shared
+      // list change.
       const before = JSON.stringify(config.order);
       const after = JSON.stringify(next.order);
       if (before !== after) resetSwitchLog();
       config = next;
       persistConfig(config);
-      return success(body.rpcId, publicConfig());
+      return success(body.rpcId, publicConfig(sessionId));
     }
     if (wrapped.endpoint === 'reset') {
-      resetSwitchLog();
-      return success(body.rpcId, publicConfig());
+      // Reset THIS session's cycle record (no sessionId → all sessions).
+      resetSwitchLog(sessionId);
+      return success(body.rpcId, publicConfig(sessionId));
     }
     if (wrapped.endpoint === 'current') {
       return success(body.rpcId, currentSelectionFor(wrapped.payload?.sessionId));

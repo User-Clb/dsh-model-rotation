@@ -364,24 +364,24 @@ window.__ModuleLoader__.load({
       }, []);
 
       function refresh() {
-        callRpc(props.ctx, "get")
+        callRpc(props.ctx, "get", { sessionId: props.sessionId ?? undefined })
           .then((value) => setConfig(value))
           .catch((reason) => setError(String(reason?.message ?? reason)));
-        callRpc(props.ctx, "catalog", {}, 60000)
+        callRpc(props.ctx, "catalog", { sessionId: props.sessionId ?? undefined }, 60000)
           .then((value) => setCatalog(value.catalog ?? []))
           .catch(() => {});
       }
 
       React.useEffect(() => {
         let alive = true;
-        callRpc(props.ctx, "get")
+        callRpc(props.ctx, "get", { sessionId: props.sessionId ?? undefined })
           .then((value) => {
             if (alive) setConfig(value);
           })
           .catch((reason) => {
             if (alive) setError(String(reason?.message ?? reason));
           });
-        callRpc(props.ctx, "catalog", {}, 60000)
+        callRpc(props.ctx, "catalog", { sessionId: props.sessionId ?? undefined }, 60000)
           .then((value) => {
             if (alive) setCatalog(value.catalog ?? []);
           })
@@ -389,7 +389,7 @@ window.__ModuleLoader__.load({
         return () => {
           alive = false;
         };
-      }, []);
+      }, [props.sessionId]);
 
       // Track the composer's current model via the Host-side resolution
       // (projection → request header → default). The trigger always shows the
@@ -422,7 +422,7 @@ window.__ModuleLoader__.load({
         setBusy(true);
         setError("");
         try {
-          const next = await callRpc(props.ctx, "set", patch);
+          const next = await callRpc(props.ctx, "set", { ...patch, sessionId: props.sessionId ?? undefined });
           if (sequence === requestSeq.current) {
             setConfig(next);
             markSaved();
@@ -456,7 +456,7 @@ window.__ModuleLoader__.load({
         setBusy(true);
         setError("");
         try {
-          const next = await callRpc(props.ctx, "reset");
+          const next = await callRpc(props.ctx, "reset", { sessionId: props.sessionId ?? undefined });
           setConfig(next);
           markSaved();
         } catch (reason) {
@@ -542,7 +542,7 @@ window.__ModuleLoader__.load({
           "button",
           {
             type: "button",
-            title: "模型轮换兜底设置",
+            title: "模型轮换兜底设置（开关仅作用于当前对话）",
             disabled: props.locked === true,
             onClick: () => setActive(!open),
             style: styles.trigger,
@@ -565,10 +565,15 @@ window.__ModuleLoader__.load({
                     type: "checkbox",
                     checked: enabled,
                     disabled: busy || !config,
-                    onChange: (event) => save({ enabled: event.target.checked }),
+                    onChange: (event) => save({ sessionEnabled: event.target.checked }),
                   }),
-                  h("span", { style: styles.label }, "开启轮换兜底（重试耗尽后自动切换模型）"),
+                  h("span", { style: styles.label }, "本对话开启轮换兜底（重试耗尽后自动切换模型；仅当前对话，不影响其他会话）"),
                 ),
+              ),
+              h(
+                "div",
+                { style: styles.row },
+                h("span", { style: styles.hint }, "轮换列表为全部对话共享；循环进度按对话独立计算。"),
               ),
               h(
                 "div",
@@ -605,7 +610,7 @@ window.__ModuleLoader__.load({
                   onBlur: (event) => flushSave({ cycleWindowMs: Math.max(1, Number(event.target.value)) * 60000 }),
                   onKeyDown: (event) => { if (event.key === "Enter") event.currentTarget.blur(); },
                 }),
-                h("span", { style: styles.hint }, `窗口内已完成 ${cycleCount} 轮`),
+                h("span", { style: styles.hint }, `本对话窗口内已完成 ${cycleCount} 轮`),
               ),
               h(
                 "div",
@@ -665,7 +670,7 @@ window.__ModuleLoader__.load({
                 { style: styles.footer },
                 h(
                   "button",
-                  { type: "button", disabled: busy, onClick: resetLog, style: { ...styles.button, ...styles.danger }, title: "清理循环记录到 0，恢复轮换预算" },
+                  { type: "button", disabled: busy, onClick: resetLog, style: { ...styles.button, ...styles.danger }, title: "清理本对话的循环记录到 0，恢复轮换预算（仅当前对话）" },
                   "重置循环记录",
                 ),
                 h(
