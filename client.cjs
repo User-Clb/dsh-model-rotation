@@ -861,11 +861,12 @@ window.__ModuleLoader__.load({
 
     const badgeStyles = {
       wrap: {
-        // Pinned to the card's top border — the card's padding-top (28px, set by
-        // the badge rule) reserves exactly this strip, so the badge's bottom
-        // edge and the editor's first line meet without overlapping.
+        // Sits ABOVE the card: `top: -20px` = the pill's own height, so its
+        // BOTTOM EDGE rests on the card's top border. The card's margin-top
+        // (set by the badge rule) reserves this strip, so nothing is covered
+        // and the editor inside the card is untouched.
         position: "absolute",
-        top: "6px",
+        top: "-20px",
         left: "12px",
         zIndex: 3,
         display: "inline-flex",
@@ -1020,31 +1021,29 @@ window.__ModuleLoader__.load({
     /**
      * Layout rule for the badge.
      *
-     * The overlay anchor is absolute with zero height, so the badge floats near
-     * the card's top edge without occupying a flow row. To stop it from
-     * covering the placeholder / first line of text, the CARD's own top padding
-     * is enlarged while the badge is present: an absolutely positioned child is
-     * placed against the padding box, so raising the card's padding pushes the
-     * editor down but leaves the badge pinned to the top border — exactly the
-     * "hug the top border, text starts below" arrangement.
+     * The badge belongs ABOVE the card, with its bottom edge meeting the card's
+     * top border — in the gap between the composer card and whatever sits over
+     * it (the thinking/status row). Two rules do that:
      *
-     * Scoped by the badge attribute so only this card changes; other cards and
-     * other plugins' overlays keep their own padding.
+     *   - the card reserves that strip with `margin-top`, so nothing overlaps
+     *     and nothing is pushed off-screen (a flex item's margin is inside the
+     *     parent's content box, so an overflow-hidden ancestor cannot clip it);
+     *   - the badge itself is absolutely positioned `top: -20px` from the
+     *     card's top edge — exactly its own height — so its BOTTOM EDGE lands
+     *     on the card's top border.
+     *
+     * The editor is untouched: no padding is added inside the card, so the
+     * placeholder and first line keep their original position.
+     *
+     * Scoped by the badge attribute so only this card changes.
      */
     function ensureBadgeStyle() {
       if (typeof document === "undefined") return;
       if (document.getElementById(BADGE_STYLE_ID)) return;
       const style = document.createElement("style");
       style.id = BADGE_STYLE_ID;
-      style.textContent = [
-        // Reserve exactly the badge strip: badge sits 6px from the top border
-        // and is ~18px tall, so 28px puts the editor's first line right below
-        // the badge's bottom edge (the card's own padding-top is 8px).
-        "[data-composer-card][data-dsh-model-badge]{padding-top:28px !important}",
-        // Lexical's editable root: zero its own top padding so the first text
-        // line hugs the badge's bottom edge instead of drifting further down.
-        '[data-composer-card][data-dsh-model-badge] [data-lexical-editor="true"]{padding-top:0 !important}',
-      ].join("\n");
+      style.textContent =
+        "[data-composer-card][data-dsh-model-badge]{margin-top:22px !important}";
       (document.head ?? document.documentElement).appendChild(style);
     }
 
