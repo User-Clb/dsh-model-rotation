@@ -93,6 +93,29 @@ const MODEL_SIDE_TEXT = [
   /failed to (fetch|connect)/i,
   /empty response/i,
   /account (is )?(suspended|disabled|expired)/i,
+  // Provider-envelope compatibility failures: the model (or its adapter route)
+  // cannot serve THIS request shape — another model in the list usually can.
+  /does not support reasoning effort/i,
+  /unsupported (reasoning )?effort/i,
+  /reasoning effort .* (is )?(not )?support/i,
+  /does not support (tool|function|vision|image|json|structured)/i,
+  // Context-window overruns surface under provider-specific envelopes
+  // ("prompt is too long", 上游 11115, 上游拒绝超限请求) — a model with a
+  // larger window in the rotation list can still serve the same turn.
+  /prompt is too long/i,
+  /prompt too long/i,
+  /context length|context window|maximum context/i,
+  /输入.*超过.*(上限|限制)/,
+  /超过了模型上限/,
+  /请求被上游拒绝/,
+  /http 400.*上游|上游.*http 400/,
+  // DNS / proxy / channel-network failures reported by channel wrappers.
+  /ENOTFOUND/,
+  /getaddrinfo/i,
+  /网络请求失败/,
+  /网络失败/,
+  /代理连通/,
+  /渠道网络/,
 ];
 
 const DEFAULTS = Object.freeze({
@@ -273,8 +296,12 @@ function isModelSideFailure(failure) {
   if (failure === null || typeof failure !== 'object') return false;
   const code = typeof failure.code === 'string' ? failure.code.toUpperCase() : 'UNKNOWN';
   if (code === 'ABORTED') return false;
-  if (code === 'CONTEXT_WINDOW_EXCEEDED') return false; // not a model outage; compaction owns it
   if (code === 'IMAGE_OFFLOAD_REQUIRED') return false;
+  // Effort/tool-capability mismatch is ALWAYS rotate-worthy (another model in
+  // the list may support the request shape) — checked before the
+  // CONTEXT_WINDOW_EXCEEDED exclusion so provider envelopes that surface it
+  // under odd codes still route by wording below.
+  if (code === 'CONTEXT_WINDOW_EXCEEDED') return false; // stable code: compaction owns it
   if (MODEL_SIDE_CODES.has(code)) {
     // QUOTA/ACCOUNT_QUOTA and AUTH are always model-side. TRANSPORT/SERVER/etc
     // route by code; UNKNOWN only counts when the wording agrees.
@@ -404,17 +431,80 @@ function registerRecovery(ctx) {
 }
 
 /**
+ * Per-model reasoning-effort compatibility cache. resolveModelInfo is cheap
+ * per provider but not free; effort ids rarely change.
+ */
+const effortCompatCache = new Map(); // key: provider\u0000model → Set(supported effort ids) | 'unknown'
+
+async function supportedEfforts(ctx, provider, model) {
+  const key = `${provider}\u0000${model}`;
+  if (effortCompatCache.has(key)) return effortCompatCache.get(key);
+  let result = 'unknown';
+  try {
+    const info = await ctx.llm.resolveModelInfo(provider, model);
+    const reasoning = info?.reasoning;
+    if (reasoning !== undefined && Array.isArray(reasoning.efforts)) {
+      result = new Set(reasoning.efforts.map((effort) => effort.id));
+      if (result.size === 0) result = 'unknown';
+    }
+    // reasoning === undefined → the model takes no effort at all; callers
+    // must STRIP the effort rather than pick a default.
+    if (reasoning === undefined) result = new Set();
+  } catch {
+    // capabilities unknown — leave 'unknown', callers pass the effort through
+  }
+  effortCompatCache.set(key, result);
+  return result;
+}
+
+/**
+ * Rewrite one proposed request config so its reasoningEffort is compatible
+ * with the target model: unsupported effort → adapter default; effort on a
+ * non-reasoning model → stripped. This runs in the agent/request waterfall —
+ * BEFORE prepareCall validates — so "does not support reasoning effort" never
+ * kills the turn. Without this, an effort mismatch thrown in prepareRequest
+ * bypasses the agent/request-error waterfall entirely (no retry, no rotation,
+ * turn dies) — the reported "本轮运行失败 … does not support reasoning effort
+ * 'on'/'high'" symptom.
+ */
+async function compatEffort(ctx, route) {
+  if (route.reasoningEffort === undefined) return route;
+  const supported = await supportedEfforts(ctx, route.provider, route.model);
+  if (supported === 'unknown') return route;
+  if (supported.has(route.reasoningEffort)) return route;
+  if (supported.size === 0) {
+    // Non-reasoning model: drop the effort entirely.
+    const { reasoningEffort: _dropped, ...stripped } = route;
+    return stripped;
+  }
+  try {
+    const info = await ctx.llm.resolveModelInfo(route.provider, route.model);
+    const defaultEffort = info?.reasoning?.defaultEffort;
+    if (defaultEffort !== undefined && supported.has(defaultEffort)) {
+      return { ...route, reasoningEffort: defaultEffort };
+    }
+  } catch {
+    /* fall through */
+  }
+  const first = supported.values().next();
+  if (!first.done) return { ...route, reasoningEffort: first.value };
+  return route;
+}
+
+/**
  * Pin the newest durable selection onto every request the loop builds. The
  * session-controller's own selection object also feeds assembly, but a retry
  * inside one open turn reuses the step's assembled snapshot; the override here
- * guarantees the rotated route is what actually dispatches.
+ * guarantees the rotated route is what actually dispatches. Also normalizes
+ * the reasoning effort of whatever route wins (rotated or hand-picked) so
+ * effort-incompatible models degrade instead of failing the turn.
  */
 function registerRouteOverride(ctx) {
   ctx.on('agent/request', async (payload, next) => {
     const resolved = await next();
-    if (!config.enabled) return resolved;
+    if (!config.enabled) return compatEffort(ctx, resolved);
     const { agent } = payload ?? {};
-    if (agent === undefined) return resolved;
+    if (agent === undefined) return compatEffort(ctx, resolved);
     const state = (() => {
       try {
         return ctx.sessionProjections.stateOf(agent.session, 'modelSelection');
@@ -423,14 +513,17 @@ function registerRouteOverride(ctx) {
       }
     })();
     const pending = state?.pending;
-    if (pending === null || pending === undefined) return resolved;
-    if (pending.provider === resolved.provider && pending.model === resolved.model) return resolved;
-    return {
-      ...resolved,
-      provider: pending.provider,
-      model: pending.model,
-      ...(pending.reasoningEffort === undefined ? {} : { reasoningEffort: pending.reasoningEffort }),
-    };
+    let route = resolved;
+    if (pending !== null && pending !== undefined
+      && (pending.provider !== resolved.provider || pending.model !== resolved.model)) {
+      route = {
+        ...resolved,
+        provider: pending.provider,
+        model: pending.model,
+        ...(pending.reasoningEffort === undefined ? {} : { reasoningEffort: pending.reasoningEffort }),
+      };
+    }
+    return compatEffort(ctx, route);
   });
 }
 
