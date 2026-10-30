@@ -382,12 +382,13 @@ window.__ModuleLoader__.load({
      */
     function ensureHideStyle() {
       if (typeof document === "undefined") return;
-      if (document.getElementById(HIDE_STYLE_ID)) return;
-      const style = document.createElement("style");
+      const css = '[data-composer-card][data-dsh-rotation-on] [data-slot="conversation.input.model"]{display:none !important}';
+      const existing = document.getElementById(HIDE_STYLE_ID);
+      if (existing !== null && existing.textContent === css) return;
+      const style = existing ?? document.createElement("style");
       style.id = HIDE_STYLE_ID;
-      style.textContent =
-        '[data-composer-card][data-dsh-rotation-on] [data-slot="conversation.input.model"]{display:none !important}';
-      (document.head ?? document.documentElement).appendChild(style);
+      style.textContent = css;
+      if (existing === null) (document.head ?? document.documentElement).appendChild(style);
     }
 
     /**
@@ -923,13 +924,27 @@ window.__ModuleLoader__.load({
      * revision, with no polling.
      *
      * The display name/multiplier/badges are not in the projection, so they
-     * come from one `describe` RPC, re-fetched whenever the projected route
-     * changes (and once on mount). A resolve failure keeps whatever it had.
+     * are resolved locally from the `catalog` snapshot (already served by the
+     * host) and re-fetched with it.
      */
     function CurrentModelBadge(props) {
       const rootRef = React.useRef(null);
-      const { described, refresh } = useCurrentDescription(props.ctx, props.sessionId);
       useCardBadgeMark(rootRef);
+
+      // Display details (provider display name, catalog model name carrying the
+      // multiplier / 免费 wording, billing badges). Resolved from the `catalog`
+      // endpoint so the badge shows full names without needing any new host
+      // endpoint to be live.
+      const [catalog, setCatalog] = React.useState([]);
+      React.useEffect(() => {
+        let alive = true;
+        callRpc(props.ctx, "catalog", { sessionId: props.sessionId ?? undefined }, 60000)
+          .then((value) => {
+            if (alive) setCatalog(value?.catalog ?? []);
+          })
+          .catch(() => {});
+        return () => { alive = false; };
+      }, [props.ctx, props.sessionId]);
 
       // Projection read: `useProjection` is part of the session standard kit
       // (a keyed hook over the session's modelSelection view). Reading it here
@@ -957,46 +972,52 @@ window.__ModuleLoader__.load({
       const model = projected?.model ?? null;
       const effort = projected?.reasoningEffort ?? null;
 
-      // Refresh display details whenever the effective route changes. The
-      // projection advances the instant a switch (rotation / "use" / hand pick)
-      // is committed, so this re-fires exactly on those transitions.
+      // If the projection is empty (fresh session, no event yet), ask the host
+      // for the effective route once and cache it until the projection speaks.
+      const [fallback, setFallback] = React.useState(null);
       React.useEffect(() => {
-        refresh();
-      }, [refresh, provider, model, effort]);
+        if (projected !== null) return undefined;
+        let alive = true;
+        callRpc(props.ctx, "current", { sessionId: props.sessionId ?? undefined }, 20000)
+          .then((value) => {
+            if (alive) setFallback(value?.current ?? null);
+          })
+          .catch(() => {});
+        return () => { alive = false; };
+      }, [props.ctx, props.sessionId, projected]);
 
-      // Immediate refresh on an announced route change (rotation "use" button):
-      // the projection advances too, but this skips a render round-trip.
-      React.useEffect(() => {
-        const onRouteChange = (event) => {
-          const changed = event?.detail?.sessionId;
-          if (changed !== undefined && changed !== null
-            && props.sessionId !== undefined && changed !== props.sessionId) return;
-          refresh();
-        };
-        window.addEventListener("dsh-model-rotation:route-changed", onRouteChange);
-        return () => window.removeEventListener("dsh-model-rotation:route-changed", onRouteChange);
-      }, [refresh, props.sessionId]);
+      const route = projected ?? fallback;
+      const providerId = route?.provider ?? null;
+      const modelId = route?.model ?? null;
+      const shownEffort = route?.reasoningEffort ?? null;
 
-      const current = described;
-      const matches = current !== null && current !== undefined
-        && (provider === null || (current.provider === provider && current.model === model));
-      const providerText = matches ? (current.providerName || current.provider) : provider;
-      const modelText = matches ? (current.modelName || current.model) : model;
-      const badges = matches ? (current.badges ?? []) : [];
-      const shownEffort = matches ? (current.reasoningEffort ?? null) : effort;
+      if (providerId === null && modelId === null) return null;
 
-      if (providerText === null && modelText === null) return null;
+      // Resolve display name + badges from the catalog snapshot.
+      let providerName = providerId;
+      let modelName = modelId;
+      let badges = [];
+      for (const group of catalog) {
+        if (group?.id !== providerId) continue;
+        providerName = group.name || providerId;
+        const found = (group.models ?? []).find((entry) => entry?.id === modelId);
+        if (found !== undefined) {
+          if (typeof found.name === "string" && found.name.length > 0) modelName = found.name;
+          if (Array.isArray(found.badges)) badges = found.badges;
+        }
+        break;
+      }
 
       return h(
         "span",
         {
           ref: rootRef,
           style: badgeStyles.wrap,
-          title: `${providerText ?? "?"} : ${modelText ?? "?"}${shownEffort ? ` (${shownEffort})` : ""}`,
+          title: `${providerName ?? "?"} : ${modelName ?? "?"}${shownEffort ? ` (${shownEffort})` : ""}`,
         },
-        h("span", { style: badgeStyles.provider }, providerText ?? "?"),
+        h("span", { style: badgeStyles.provider }, providerName ?? "?"),
         h("span", { style: badgeStyles.sep }, ":"),
-        h("span", { style: badgeStyles.model }, modelText ?? "?"),
+        h("span", { style: badgeStyles.model }, modelName ?? "?"),
         shownEffort ? h("span", { style: badgeStyles.effort }, shownEffort) : null,
         badges.map((badge) =>
           h(
@@ -1042,12 +1063,16 @@ window.__ModuleLoader__.load({
      */
     function ensureBadgeStyle() {
       if (typeof document === "undefined") return;
-      if (document.getElementById(BADGE_STYLE_ID)) return;
-      const style = document.createElement("style");
+      const css = "[data-composer-card][data-dsh-model-badge]{margin-top:34px !important}";
+      const existing = document.getElementById(BADGE_STYLE_ID);
+      if (existing !== null && existing.textContent === css) return;
+      // A hot-reloaded module finds the PREVIOUS injection still in the DOM.
+      // Overwrite its text instead of bailing out, or a stale spacing rule
+      // would survive every reload.
+      const style = existing ?? document.createElement("style");
       style.id = BADGE_STYLE_ID;
-      style.textContent =
-        "[data-composer-card][data-dsh-model-badge]{margin-top:34px !important}";
-      (document.head ?? document.documentElement).appendChild(style);
+      style.textContent = css;
+      if (existing === null) (document.head ?? document.documentElement).appendChild(style);
     }
 
     /** Mark the hosting composer card while the badge is rendered. */
@@ -1078,29 +1103,6 @@ window.__ModuleLoader__.load({
           markedCard?.removeAttribute(BADGE_ATTR);
         };
       }, []);
-    }
-
-    /**
-     * Fetch the display description for the CURRENT route and keep it fresh.
-     * `describe` resolves through the same chain the next request uses (pending
-     * → lastUsed → request header → deployment default), so the badge never
-     * advertises a route the composer is not actually on.
-     */
-    function useCurrentDescription(ctx, sessionId) {
-      const [described, setDescribed] = React.useState(null);
-      const seq = React.useRef(0);
-      const fetch = React.useCallback(() => {
-        if (sessionId === undefined) return;
-        const mine = ++seq.current;
-        callRpc(ctx, "describe", { sessionId }, 20000)
-          .then((value) => {
-            if (mine === seq.current) setDescribed(value?.current ?? null);
-          })
-          .catch(() => {
-            /* keep the previous description; the projection still drives the text */
-          });
-      }, [ctx, sessionId]);
-      return { described, refresh: fetch, setDescribed };
     }
 
     function apply(ctx) {

@@ -1,6 +1,6 @@
 {
   "name": "dsh-model-rotation",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "private": true,
   "description": "DSH 模型轮换兜底插件：重试预算耗尽或模型侧故障（额度用尽/429/soft_rate/推理强度不兼容/网络异常等）时，按预设的跨平台模型顺序循环切换继续运行。输入框内组件配置，列表可拖动排序、标识当前模型并支持一键设为起始模型，与模型选择列表联动。",
   "type": "module",
