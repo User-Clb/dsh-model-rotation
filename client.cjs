@@ -373,6 +373,73 @@ window.__ModuleLoader__.load({
       );
     }
 
+    const HIDE_STYLE_ID = "dsh-model-rotation-hide-style";
+
+    /**
+     * One global rule: hide the composer's single-select model seat while the
+     * rotation control in THIS composer card is enabled. Scoping to the card
+     * keeps other sessions' composers (with rotation off) untouched.
+     */
+    function ensureHideStyle() {
+      if (typeof document === "undefined") return;
+      if (document.getElementById(HIDE_STYLE_ID)) return;
+      const style = document.createElement("style");
+      style.id = HIDE_STYLE_ID;
+      style.textContent =
+        '[data-composer-card][data-dsh-rotation-on] [data-slot="conversation.input.model"]{display:none !important}';
+      (document.head ?? document.documentElement).appendChild(style);
+    }
+
+    /**
+     * Mark (or unmark) the composer card that hosts this control. The host
+     * InputBar re-renders freely, but plain attributes on its DOM node survive
+     * reconciliation as long as React doesn't own the attribute — it doesn't.
+     * A MutationObserver re-applies the mark if the card node is ever replaced.
+     */
+    function useCardRotationMark(rootRef, on) {
+      React.useEffect(() => {
+        if (typeof document === "undefined") return;
+        ensureHideStyle();
+        let observer = undefined;
+        let markedCard = undefined;
+
+        const findCard = () => {
+          const node = rootRef.current;
+          if (node === null || node === undefined || node.ownerDocument !== document) return null;
+          return node.closest("[data-composer-card]");
+        };
+
+        const apply = () => {
+          // Fast path: still correctly marked — skip the DOM walk. The card
+          // node may be recreated during streaming (many childList mutations),
+          // and this observer must stay O(1) per mutation.
+          if (
+            markedCard !== undefined
+            && markedCard.isConnected
+            && markedCard.hasAttribute("data-dsh-rotation-on") === on
+          ) return;
+          const card = findCard();
+          if (card === null) return;
+          if (markedCard !== undefined && markedCard !== card) {
+            markedCard.removeAttribute("data-dsh-rotation-on");
+          }
+          markedCard = card;
+          if (on) card.setAttribute("data-dsh-rotation-on", "1");
+          else card.removeAttribute("data-dsh-rotation-on");
+        };
+
+        apply();
+        // The card node may be recreated (session switch, layout change) while
+        // this control persists; watch for that and re-mark.
+        observer = new MutationObserver(apply);
+        observer.observe(document.body, { childList: true, subtree: true });
+        return () => {
+          observer?.disconnect();
+          markedCard?.removeAttribute("data-dsh-rotation-on");
+        };
+      }, [on]);
+    }
+
     function Control(props) {
       const [open, setOpen] = React.useState(false);
       const [config, setConfig] = React.useState(null);
@@ -392,6 +459,7 @@ window.__ModuleLoader__.load({
       const saveTimer = React.useRef(null);
       const savedTimer = React.useRef(null);
       const requestSeq = React.useRef(0);
+      const rootRef = React.useRef(null);
 
       const activeRef = React.useRef(false);
 
@@ -612,9 +680,14 @@ window.__ModuleLoader__.load({
       const currentKey = currentSelection ? `${currentSelection.provider}\u0000${currentSelection.model}` : null;
       const cycleCount = config?.cycleCount ?? 0;
 
+      // Rotation ON in this conversation → hide the composer's single-select
+      // model seat; OFF → show it again. With an empty list there is nothing
+      // to rotate through, so keep the seat visible as the model entry point.
+      useCardRotationMark(rootRef, enabled && order.length > 0);
+
       return h(
         "div",
-        { style: styles.root },
+        { style: styles.root, ref: rootRef },
         h(
           "button",
           {
