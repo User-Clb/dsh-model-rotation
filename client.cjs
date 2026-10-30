@@ -197,6 +197,19 @@ window.__ModuleLoader__.load({
         fontSize: "13px",
         lineHeight: "1",
       },
+      useButton: {
+        flex: "none",
+        height: "18px",
+        padding: "0 7px",
+        borderRadius: "999px",
+        border: "1px solid var(--dsw-alias-border-l2, #d9d9d9)",
+        background: "transparent",
+        color: "var(--dsw-alias-label-secondary, #666)",
+        cursor: "pointer",
+        fontSize: "10px",
+        lineHeight: "16px",
+        whiteSpace: "nowrap",
+      },
       add: {
         display: "flex",
         alignItems: "center",
@@ -273,7 +286,7 @@ window.__ModuleLoader__.load({
       return (catalog ?? []).filter((g) => (g.models ?? []).length > 0);
     }
 
-    function Row({ row, index, isCurrent, dragging, over, onGripDown, onRemove }) {
+    function Row({ row, index, isCurrent, dragging, over, disabled, onGripDown, onUse, onRemove }) {
       return h(
         "div",
         {
@@ -299,6 +312,19 @@ window.__ModuleLoader__.load({
         h("span", { style: styles.model, title: row.model }, row.model),
         row.reasoningEffort ? h("span", { style: styles.hint }, row.reasoningEffort) : null,
         isCurrent ? h("span", { style: styles.badge, title: "当前模型" }) : null,
+        isCurrent
+          ? null
+          : h(
+              "button",
+              {
+                type: "button",
+                style: styles.useButton,
+                title: "设为当前模型（同步到模型下拉，轮换从此行的下一个继续）",
+                disabled: disabled,
+                onClick: () => onUse(index),
+              },
+              "使用",
+            ),
         h(
           "button",
           {
@@ -529,6 +555,21 @@ window.__ModuleLoader__.load({
         save({ order: next });
       }
 
+      async function useRow(index) {
+        setBusy(true);
+        setError("");
+        try {
+          const value = await callRpc(props.ctx, "use", { index, sessionId: props.sessionId ?? undefined });
+          setConfig(value);
+          if (value?.current) setCurrentSelection(value.current);
+          markSaved();
+        } catch (reason) {
+          setError(String(reason?.message ?? reason));
+        } finally {
+          setBusy(false);
+        }
+      }
+
       const enabled = config?.enabled === true;
       const groups = React.useMemo(() => providerGroups(catalog), [catalog]);
       const order = config?.order ?? [];
@@ -625,7 +666,9 @@ window.__ModuleLoader__.load({
                         isCurrent: currentKey !== null && `${row.provider}\u0000${row.model}` === currentKey,
                         dragging: draggingIndex === index,
                         over: overIndex === index,
+                        disabled: busy,
                         onGripDown: beginDrag,
+                        onUse: useRow,
                         onRemove: removeRow,
                       }),
                     ),

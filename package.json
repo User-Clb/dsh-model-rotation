@@ -1,6 +1,6 @@
 {
   "name": "dsh-model-rotation",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "description": "模型轮换兜底：模型请求在重试预算耗尽后或遇到额度用尽/429/soft_rate 等模型侧故障时，按预设的跨平台模型顺序循环切换继续；输入框内组件配置，列表可拖动排序并标识当前轮换模型，与模型选择列表联动。",
   "type": "module",

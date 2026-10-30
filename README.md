@@ -23,6 +23,7 @@
   - 轮换切换走官方 `session.selectModel` 同一条持久化路径（`model/selection` 事件 + modelSelection 投影），composer 模型座位、`/model` 弹窗、会话投影**自动跟随显示新模型**；
   - 列表内当前实际生效的模型以**绿色圆点**实时标识，轮换到哪行圆点跟到哪行；
   - 当前模型解析链与 session-controller 一致：投影 pending → lastUsed → 请求头 → 部署默认模型，全新会话也能正确显示。
+- **行内「使用」按钮（起始模型）**：把轮换列表中的任一行直接设为当前使用模型——自动同步到 composer 的模型下拉选择；下一次故障轮换从该行的**下一个**继续，等于手动指定轮换起点。
 
 ### 安装
 
@@ -122,6 +123,7 @@ MIT
 - **Cross-platform catalog**: reads every configured provider through `ctx.llm.listProviders()` / `listModels()`; freely mix DeepSeek, WorkBuddy, NVIDIA NIM, AMD, OpenRouter, Zhipu, iFlytek and more in one ordered list.
 - **Cycle budget**: one round = every model tried once. After `maxCycles` (default 3) complete rounds within `cycleWindowMs` (default 30 min), rotation stops and the failure surfaces normally. A reset button clears the record.
 - **In-composer panel**: enable switch, cycle settings, drag-sortable list with add/remove, and the reset button — all inside the composer's activity area.
+- **Inline "use" button (start model)**: any row in the rotation list can be set as the session's active model in one click — synced to the composer model picker; the next rotation continues from the row AFTER it, effectively choosing the rotation start point.
 - **Synced with the model picker**: rotation writes the same durable `model/selection` event as the official `session.selectModel` RPC, so the composer model seat, `/model` popup and session projections follow automatically; the currently effective model is marked with a green dot in the list.
 
 ### Install / Configure

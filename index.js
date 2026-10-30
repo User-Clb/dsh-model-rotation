@@ -784,6 +784,27 @@ async function handleRpc(request) {
       resetSwitchLog(sessionId);
       return success(body.rpcId, publicConfig(sessionId));
     }
+    if (wrapped.endpoint === 'use') {
+      // "设为当前模型": install a rotation-list row as the session's active
+      // model through the official selection path — the composer model picker
+      // syncs automatically, and the next rotation continues from this row.
+      const index = Number(wrapped.payload?.index);
+      const row = Number.isInteger(index) && index >= 0 && index < config.order.length
+        ? config.order[index]
+        : undefined;
+      if (row === undefined) {
+        return failure(body.rpcId, 'invalid-request', `no rotation row at index ${wrapped.payload?.index}`);
+      }
+      const ctx = ctxRef;
+      if (ctx === undefined) return failure(body.rpcId, 'not-ready', 'host context unavailable');
+      const agents = ctx.get?.('agents');
+      const agent = typeof sessionId === 'string' && agents !== undefined ? agents.get(sessionId) : undefined;
+      if (agent === undefined) {
+        return failure(body.rpcId, 'session-unavailable', `no live agent for session ${sessionId ?? '(unknown)'}`);
+      }
+      const selection = await applySelection(ctx, agent, row);
+      return success(body.rpcId, { current: selection, ...publicConfig(sessionId) });
+    }
     if (wrapped.endpoint === 'current') {
       return success(body.rpcId, currentSelectionFor(wrapped.payload?.sessionId));
     }
