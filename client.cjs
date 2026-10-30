@@ -666,10 +666,29 @@ window.__ModuleLoader__.load({
           setConfig(value);
           if (value?.current) setCurrentSelection(value.current);
           markSaved();
+          announceRouteChange();
         } catch (reason) {
           setError(String(reason?.message ?? reason));
         } finally {
           setBusy(false);
+        }
+      }
+
+      /**
+       * Broadcast that this session's effective route changed. The badge reads
+       * the modelSelection projection, which advances on the committed event —
+       * but a `use`/rotation switch also needs the DISPLAY details refetched
+       * (the projection carries only provider/model/effort). This window event
+       * lets the badge refresh immediately instead of waiting for the next
+       * projection revision to be observed.
+       */
+      function announceRouteChange() {
+        try {
+          window.dispatchEvent(new CustomEvent("dsh-model-rotation:route-changed", {
+            detail: { sessionId: props.sessionId ?? null },
+          }));
+        } catch {
+          /* ignore */
         }
       }
 
@@ -840,29 +859,304 @@ window.__ModuleLoader__.load({
       );
     }
 
+    const badgeStyles = {
+      wrap: {
+        // Pinned to the card's top border — the card's padding-top (28px, set by
+        // the badge rule) reserves exactly this strip, so the badge's bottom
+        // edge and the editor's first line meet without overlapping.
+        position: "absolute",
+        top: "6px",
+        left: "12px",
+        zIndex: 3,
+        display: "inline-flex",
+        alignItems: "center",
+        gap: "5px",
+        maxWidth: "calc(100% - 20px)",
+        padding: "1px 7px",
+        borderRadius: "999px",
+        border: "1px solid var(--dsw-alias-border-l2, #d9d9d9)",
+        background: "var(--dsw-alias-bg-layer-2, rgba(255,255,255,.6))",
+        backdropFilter: "blur(4px)",
+        color: "var(--dsw-alias-label-secondary, #666)",
+        fontSize: "11px",
+        lineHeight: "16px",
+        whiteSpace: "nowrap",
+        pointerEvents: "auto",
+        userSelect: "none",
+      },
+      provider: {
+        color: "var(--dsw-alias-label-tertiary, #999)",
+        flex: "none",
+        maxWidth: "90px",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+      },
+      sep: { color: "var(--dsw-alias-label-tertiary, #999)", flex: "none" },
+      model: {
+        color: "var(--dsw-alias-label-primary, #111)",
+        fontWeight: 500,
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        minWidth: 0,
+      },
+      effort: { color: "var(--dsw-alias-label-tertiary, #999)", flex: "none" },
+      chip: {
+        flex: "none",
+        fontSize: "10px",
+        lineHeight: "13px",
+        padding: "0 4px",
+        borderRadius: "3px",
+        border: "1px solid",
+        whiteSpace: "nowrap",
+      },
+      empty: { color: "var(--dsw-alias-label-tertiary, #999)" },
+    };
+
+    /**
+     * The composer badge: provider : full model name (multiplier + badges).
+     *
+     * Realtime by construction — it reads the `modelSelection` projection
+     * straight from the session (the same durable state every other surface
+     * renders from), so a rotation switch, a rotation-row "use", or a
+     * hand-picked model in the seat all move the badge on the next projection
+     * revision, with no polling.
+     *
+     * The display name/multiplier/badges are not in the projection, so they
+     * come from one `describe` RPC, re-fetched whenever the projected route
+     * changes (and once on mount). A resolve failure keeps whatever it had.
+     */
+    function CurrentModelBadge(props) {
+      const rootRef = React.useRef(null);
+      const { described, refresh } = useCurrentDescription(props.ctx, props.sessionId);
+      useCardBadgeMark(rootRef);
+
+      // Projection read: `useProjection` is part of the session standard kit
+      // (a keyed hook over the session's modelSelection view). Reading it here
+      // makes the badge follow every durable switch with zero polling.
+      let projected = null;
+      try {
+        if (typeof props.useProjection === "function") {
+          projected = props.useProjection("modelSelection", (state) => {
+            if (state === null || state === undefined) return null;
+            // Wire view exposes `next`; raw state exposes pending/lastUsed.
+            const settled = state.next !== undefined ? state.next : (state.pending ?? state.lastUsed);
+            if (settled === null || settled === undefined) return null;
+            return {
+              provider: settled.provider,
+              model: settled.model,
+              reasoningEffort: settled.reasoningEffort ?? null,
+            };
+          });
+        }
+      } catch {
+        projected = null;
+      }
+
+      const provider = projected?.provider ?? null;
+      const model = projected?.model ?? null;
+      const effort = projected?.reasoningEffort ?? null;
+
+      // Refresh display details whenever the effective route changes. The
+      // projection advances the instant a switch (rotation / "use" / hand pick)
+      // is committed, so this re-fires exactly on those transitions.
+      React.useEffect(() => {
+        refresh();
+      }, [refresh, provider, model, effort]);
+
+      // Immediate refresh on an announced route change (rotation "use" button):
+      // the projection advances too, but this skips a render round-trip.
+      React.useEffect(() => {
+        const onRouteChange = (event) => {
+          const changed = event?.detail?.sessionId;
+          if (changed !== undefined && changed !== null
+            && props.sessionId !== undefined && changed !== props.sessionId) return;
+          refresh();
+        };
+        window.addEventListener("dsh-model-rotation:route-changed", onRouteChange);
+        return () => window.removeEventListener("dsh-model-rotation:route-changed", onRouteChange);
+      }, [refresh, props.sessionId]);
+
+      const current = described;
+      const matches = current !== null && current !== undefined
+        && (provider === null || (current.provider === provider && current.model === model));
+      const providerText = matches ? (current.providerName || current.provider) : provider;
+      const modelText = matches ? (current.modelName || current.model) : model;
+      const badges = matches ? (current.badges ?? []) : [];
+      const shownEffort = matches ? (current.reasoningEffort ?? null) : effort;
+
+      if (providerText === null && modelText === null) return null;
+
+      return h(
+        "span",
+        {
+          ref: rootRef,
+          style: badgeStyles.wrap,
+          title: `${providerText ?? "?"} : ${modelText ?? "?"}${shownEffort ? ` (${shownEffort})` : ""}`,
+        },
+        h("span", { style: badgeStyles.provider }, providerText ?? "?"),
+        h("span", { style: badgeStyles.sep }, ":"),
+        h("span", { style: badgeStyles.model }, modelText ?? "?"),
+        shownEffort ? h("span", { style: badgeStyles.effort }, shownEffort) : null,
+        badges.map((badge) =>
+          h(
+            "span",
+            {
+              key: badge,
+              style: {
+                ...badgeStyles.chip,
+                borderColor: badgeColor(badge).border,
+                color: badgeColor(badge).color,
+              },
+            },
+            badge,
+          ),
+        ),
+      );
+    }
+
+    const BADGE_STYLE_ID = "dsh-model-rotation-badge-style";
+    const BADGE_ATTR = "data-dsh-model-badge";
+
+    /**
+     * Layout rule for the badge.
+     *
+     * The overlay anchor is absolute with zero height, so the badge floats near
+     * the card's top edge without occupying a flow row. To stop it from
+     * covering the placeholder / first line of text, the CARD's own top padding
+     * is enlarged while the badge is present: an absolutely positioned child is
+     * placed against the padding box, so raising the card's padding pushes the
+     * editor down but leaves the badge pinned to the top border — exactly the
+     * "hug the top border, text starts below" arrangement.
+     *
+     * Scoped by the badge attribute so only this card changes; other cards and
+     * other plugins' overlays keep their own padding.
+     */
+    function ensureBadgeStyle() {
+      if (typeof document === "undefined") return;
+      if (document.getElementById(BADGE_STYLE_ID)) return;
+      const style = document.createElement("style");
+      style.id = BADGE_STYLE_ID;
+      style.textContent = [
+        // Reserve exactly the badge strip: badge sits 6px from the top border
+        // and is ~18px tall, so 28px puts the editor's first line right below
+        // the badge's bottom edge (the card's own padding-top is 8px).
+        "[data-composer-card][data-dsh-model-badge]{padding-top:28px !important}",
+        // Lexical's editable root: zero its own top padding so the first text
+        // line hugs the badge's bottom edge instead of drifting further down.
+        '[data-composer-card][data-dsh-model-badge] [data-lexical-editor="true"]{padding-top:0 !important}',
+      ].join("\n");
+      (document.head ?? document.documentElement).appendChild(style);
+    }
+
+    /** Mark the hosting composer card while the badge is rendered. */
+    function useCardBadgeMark(rootRef) {
+      React.useEffect(() => {
+        if (typeof document === "undefined") return undefined;
+        ensureBadgeStyle();
+        let observer = undefined;
+        let markedCard = undefined;
+        const findCard = () => {
+          const node = rootRef.current;
+          if (node === null || node === undefined || node.ownerDocument !== document) return null;
+          return node.closest("[data-composer-card]");
+        };
+        const apply = () => {
+          if (markedCard !== undefined && markedCard.isConnected && markedCard.hasAttribute(BADGE_ATTR)) return;
+          const card = findCard();
+          if (card === null) return;
+          if (markedCard !== undefined && markedCard !== card) markedCard.removeAttribute(BADGE_ATTR);
+          markedCard = card;
+          card.setAttribute(BADGE_ATTR, "1");
+        };
+        apply();
+        observer = new MutationObserver(apply);
+        observer.observe(document.body, { childList: true, subtree: true });
+        return () => {
+          observer?.disconnect();
+          markedCard?.removeAttribute(BADGE_ATTR);
+        };
+      }, []);
+    }
+
+    /**
+     * Fetch the display description for the CURRENT route and keep it fresh.
+     * `describe` resolves through the same chain the next request uses (pending
+     * → lastUsed → request header → deployment default), so the badge never
+     * advertises a route the composer is not actually on.
+     */
+    function useCurrentDescription(ctx, sessionId) {
+      const [described, setDescribed] = React.useState(null);
+      const seq = React.useRef(0);
+      const fetch = React.useCallback(() => {
+        if (sessionId === undefined) return;
+        const mine = ++seq.current;
+        callRpc(ctx, "describe", { sessionId }, 20000)
+          .then((value) => {
+            if (mine === seq.current) setDescribed(value?.current ?? null);
+          })
+          .catch(() => {
+            /* keep the previous description; the projection still drives the text */
+          });
+      }, [ctx, sessionId]);
+      return { described, refresh: fetch, setDescribed };
+    }
+
     function apply(ctx) {
       ctx.effect(() => {
+        const disposers = [];
+        // 1) The rotation control in the composer's activity area.
         try {
-          return ctx.slots.inject("conversation.input.activity", () =>
-            ctx.slots.register(
-              {
-                name: "conversation.input.activity",
-                id: "model-rotation",
-                order: 41,
-                label: () => "模型轮换",
-              },
-              (props) => h(Boundary, null, h(Control, { ...props, ctx })),
+          disposers.push(
+            ctx.slots.inject("conversation.input.activity", () =>
+              ctx.slots.register(
+                {
+                  name: "conversation.input.activity",
+                  id: "model-rotation",
+                  order: 41,
+                  label: () => "模型轮换",
+                },
+                (props) => h(Boundary, null, h(Control, { ...props, ctx })),
+              ),
             ),
           );
         } catch (error) {
           try {
-            console.warn("[model-rotation] composer slot unavailable:", error);
+            console.warn("[model-rotation] composer activity slot unavailable:", error);
           } catch {
             /* ignore */
           }
-          return () => {};
         }
-      }, "model-rotation: composer activity");
+        // 2) The live current-model badge over the composer's top-left corner.
+        try {
+          disposers.push(
+            ctx.slots.inject("conversation.input.overlay", () =>
+              ctx.slots.register(
+                {
+                  name: "conversation.input.overlay",
+                  id: "model-rotation-current-badge",
+                  order: 40,
+                },
+                (props) => h(Boundary, null, h(CurrentModelBadge, { ...props, ctx })),
+              ),
+            ),
+          );
+        } catch (error) {
+          try {
+            console.warn("[model-rotation] composer overlay slot unavailable:", error);
+          } catch {
+            /* ignore */
+          }
+        }
+        return () => {
+          for (const dispose of disposers) {
+            try {
+              dispose();
+            } catch {
+              /* ignore */
+            }
+          }
+        };
+      }, "model-rotation: composer slots");
     }
 
     exports.apply = apply;

@@ -767,6 +767,47 @@ function currentSelectionFor(sessionId) {
   }
 }
 
+/**
+ * One-call description of the session's ACTUAL current route, resolved for
+ * display: provider, model id, the catalog display name (which already carries
+ * the multiplier / 免费 wording), the provider's display name and any billing
+ * badges. Resolution follows the same chain as currentSelectionFor, so the
+ * badge never shows a route the next request would not use.
+ */
+async function describeCurrent(ctx, sessionId) {
+  const resolved = currentSelectionFor(sessionId);
+  const selection = resolved.current;
+  if (selection === null || selection === undefined) return { current: null };
+
+  let providerName;
+  let modelName = selection.model;
+  let badges = [];
+  try {
+    const llm = ctx.llm;
+    const provider = llm.listProviders().find((entry) => entry.id === selection.provider);
+    if (provider !== undefined) providerName = provider.displayName ?? provider.id;
+    const listed = await llm.listModels(selection.provider);
+    const found = listed.find((model) => model.id === selection.model);
+    if (found !== undefined && typeof found.name === 'string') modelName = found.name;
+    if (/workbuddy/i.test(selection.provider)) {
+      const badgeMap = readWorkbuddyBadges();
+      if (badgeMap.has(selection.model)) badges = badgeMap.get(selection.model);
+    }
+  } catch {
+    /* display is best-effort: fall back to the raw route */
+  }
+  return {
+    current: {
+      provider: selection.provider,
+      providerName: providerName ?? selection.provider,
+      model: selection.model,
+      modelName,
+      badges,
+      ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
+    },
+  };
+}
+
 const execFileAsync = promisify(execFile);
 
 async function pickNative() {
@@ -876,6 +917,11 @@ async function handleRpc(request) {
     }
     if (wrapped.endpoint === 'current') {
       return success(body.rpcId, currentSelectionFor(wrapped.payload?.sessionId));
+    }
+    if (wrapped.endpoint === 'describe') {
+      const ctx = ctxRef;
+      if (ctx === undefined) return failure(body.rpcId, 'not-ready', 'host context unavailable');
+      return success(body.rpcId, await describeCurrent(ctx, sessionId));
     }
     if (wrapped.endpoint === 'pickFile') {
       return success(body.rpcId, await pickNative());
