@@ -276,17 +276,33 @@ window.__ModuleLoader__.load({
       const map = new Map();
       for (const group of catalog ?? []) {
         for (const model of group.models ?? []) {
-          map.set(`${group.id}\u0000${model.id}`, { provider: group.id, modelName: model.name });
+          map.set(`${group.id}\u0000${model.id}`, {
+            providerName: group.name,
+            modelName: model.name,
+            badges: Array.isArray(model.badges) ? model.badges : [],
+          });
         }
       }
       return map;
+    }
+
+    /** Badge text → chip color (mirrors the model picker's palette). */
+    function badgeColor(badge) {
+      if (/免费/.test(badge)) return { border: "#22c55e", color: "#22c55e" };
+      if (/折扣|半价|优惠/.test(badge)) return { border: "#f59e0b", color: "#f59e0b" };
+      if (/订阅|优先|专属/.test(badge)) return { border: "#4b7bec", color: "#4b7bec" };
+      return { border: "var(--dsw-alias-border-l2, #999)", color: "var(--dsw-alias-label-secondary, #666)" };
     }
 
     function providerGroups(catalog) {
       return (catalog ?? []).filter((g) => (g.models ?? []).length > 0);
     }
 
-    function Row({ row, index, isCurrent, dragging, over, disabled, onGripDown, onUse, onRemove }) {
+    function Row({ row, index, isCurrent, dragging, over, disabled, display, onGripDown, onUse, onRemove }) {
+      const info = display.get(`${row.provider}\u0000${row.model}`);
+      // Full display name (with multiplier / 免费 wording) instead of the raw id.
+      const shown = info?.modelName && info.modelName !== row.model ? info.modelName : row.model;
+      const badges = info?.badges ?? [];
       return h(
         "div",
         {
@@ -309,7 +325,26 @@ window.__ModuleLoader__.load({
           "⠿",
         ),
         h("span", { style: styles.provider, title: row.provider }, row.provider),
-        h("span", { style: styles.model, title: row.model }, row.model),
+        h("span", { style: styles.model, title: `${row.model}${info?.modelName ? ` · ${info.modelName}` : ""}` }, shown),
+        badges.map((badge) =>
+          h(
+            "span",
+            {
+              key: badge,
+              style: {
+                flex: "none",
+                fontSize: "10px",
+                lineHeight: "14px",
+                padding: "0 5px",
+                borderRadius: "4px",
+                border: `1px solid ${badgeColor(badge).border}`,
+                color: badgeColor(badge).color,
+                whiteSpace: "nowrap",
+              },
+            },
+            badge,
+          ),
+        ),
         row.reasoningEffort ? h("span", { style: styles.hint }, row.reasoningEffort) : null,
         isCurrent ? h("span", { style: styles.badge, title: "当前模型" }) : null,
         isCurrent
@@ -572,6 +607,7 @@ window.__ModuleLoader__.load({
 
       const enabled = config?.enabled === true;
       const groups = React.useMemo(() => providerGroups(catalog), [catalog]);
+      const display = React.useMemo(() => catalogMap(catalog), [catalog]);
       const order = config?.order ?? [];
       const currentKey = currentSelection ? `${currentSelection.provider}\u0000${currentSelection.model}` : null;
       const cycleCount = config?.cycleCount ?? 0;
@@ -667,6 +703,7 @@ window.__ModuleLoader__.load({
                         dragging: draggingIndex === index,
                         over: overIndex === index,
                         disabled: busy,
+                        display,
                         onGripDown: beginDrag,
                         onUse: useRow,
                         onRemove: removeRow,

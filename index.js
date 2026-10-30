@@ -168,7 +168,13 @@ function normalizeCatalog(input) {
     const models = Array.isArray(group.models)
       ? group.models
           .map((m) => (m && typeof m === 'object' && typeof m.id === 'string' && m.id.trim().length > 0
-            ? { id: m.id, name: typeof m.name === 'string' && m.name.trim().length > 0 ? m.name : m.id }
+            ? {
+                id: m.id,
+                name: typeof m.name === 'string' && m.name.trim().length > 0 ? m.name : m.id,
+                ...(Array.isArray(m.badges) && m.badges.length > 0
+                  ? { badges: m.badges.filter((b) => typeof b === 'string' && b.length > 0) }
+                  : {}),
+              }
             : null))
           .filter(Boolean)
       : [];
@@ -618,17 +624,80 @@ function failure(rpcId, code, message) {
   });
 }
 
+/**
+ * Billing badges (夜间免费/限时免费/订阅优先/…) exposed by the workbuddy
+ * connect plugin's local catalog caches. The DSH llm layer itself does not
+ * carry badge metadata, so we merge it in from the catalog files the plugin
+ * maintains. These caches describe WORKBUDDY-family accounts only — other
+ * providers (qoder/trae/cline/raccoon) bake their multiplier/免费 wording
+ * into listModels names already — so the merge is scoped to workbuddy
+ * provider ids, preventing an id like "deepseek-v4.1-flash" from carrying a
+ * workbuddy badge onto trae. Shape-tolerant: any unreadable/missing piece
+ * degrades to no badges, never an error.
+ */
+function readWorkbuddyBadges() {
+  const badgesByModel = new Map(); // modelId → string[]
+  try {
+    const dshHome = process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh');
+    for (const file of ['.workbuddy-catalog.json', '.workbuddy-ai-catalog.json']) {
+      const catalogFile = path.join(dshHome, file);
+      if (!existsSync(catalogFile)) continue;
+      try {
+        const raw = JSON.parse(readFileSync(catalogFile, 'utf8').replace(/^\uFEFF/u, ''));
+        const entries = raw?.entries;
+        if (entries === null || typeof entries !== 'object') continue;
+        for (const entry of Object.values(entries)) {
+          for (const model of entry?.models ?? []) {
+            if (typeof model?.id !== 'string') continue;
+            const badges = Array.isArray(model?.billing?.badges)
+              ? model.billing.badges.filter((b) => typeof b === 'string' && b.length > 0)
+              : [];
+            // free=true adds a 免费 chip only when no existing badge already
+            // says 免费 (限时免费/独家限免 cover it).
+            if (model?.billing?.free === true && !badges.some((b) => b.includes('免费') || b.includes('限免'))) {
+              badges.unshift('免费');
+            }
+            if (badges.length > 0) {
+              const existing = badgesByModel.get(model.id) ?? [];
+              for (const badge of badges) if (!existing.includes(badge)) existing.push(badge);
+              badgesByModel.set(model.id, existing);
+            }
+          }
+        }
+      } catch {
+        /* one unreadable catalog file must not break the other */
+      }
+    }
+    // Multi-account merge can stack a bare 免费 next to 限时免费/独家限免.
+    // Keep the specific badge; drop the generic one when a specific exists.
+    for (const [id, badges] of badgesByModel) {
+      if (badges.length > 1 && badges.includes('免费') && badges.some((b) => b !== '免费' && (b.includes('免费') || b.includes('限免')))) {
+        badgesByModel.set(id, badges.filter((b) => b !== '免费'));
+      }
+    }
+  } catch {
+    /* badges are display sugar; absence is fine */
+  }
+  return badgesByModel;
+}
+
 /** Build the display catalog from the live llm service (all providers/models). */
 async function buildCatalog(llm) {
   const groups = [];
   try {
     const providers = llm.listProviders();
+    const badges = readWorkbuddyBadges();
     for (const provider of providers) {
       const id = provider.id;
+      const badgeScope = /workbuddy/i.test(id);
       let models = [];
       try {
         const listed = await llm.listModels(id);
-        models = listed.map((m) => ({ id: m.id, name: m.name }));
+        models = listed.map((m) => ({
+          id: m.id,
+          name: m.name,
+          ...(badgeScope && badges.has(m.id) ? { badges: badges.get(m.id) } : {}),
+        }));
       } catch {
         models = [];
       }
