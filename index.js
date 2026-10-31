@@ -359,13 +359,11 @@ function isModelSideFailure(failure) {
   const code = typeof failure.code === 'string' ? failure.code.toUpperCase() : 'UNKNOWN';
   if (code === 'ABORTED') return false;
   if (code === 'IMAGE_OFFLOAD_REQUIRED') return false;
-  // CONTEXT_WINDOW_EXCEEDED is NOT an outage: compaction owns the first
-  // attempt. But this waterfall runs AFTER compaction's listener, so by the
-  // time we see the code here compaction has already tried (and either failed
-  // or exhausted its retries). A larger-context model in the rotation list can
-  // still serve the same turn, so it IS rotate-worthy at this point.
-  // Provider envelopes that wrap the overflow in an odd code (workbuddy
-  // 11115 -> code "client") reach us through the wording rules below instead.
+  // CONTEXT_WINDOW_EXCEEDED: compaction tries first (its listener precedes
+  // this one), so reaching us means the prompt still does not fit. Rotate in
+  // plain list order like any other failure — no capacity comparison. Provider
+  // envelopes that wrap the same overflow in an odd code (workbuddy 11115 ->
+  // code "client") arrive through the wording rules below.
   if (code === 'CONTEXT_WINDOW_EXCEEDED') return true;
   if (MODEL_SIDE_CODES.has(code)) {
     // QUOTA/ACCOUNT_QUOTA and AUTH are always model-side. TRANSPORT/SERVER/etc
@@ -444,50 +442,18 @@ async function applySelection(ctx, agent, row) {
  * budget rotates past on its next failure.
  */
 /**
- * Context capacity of one route, or undefined when the adapter does not report
- * it. Used only by the overflow guard below.
+ * Rotate to the next model in list order. No candidate filtering: every model
+ * gets the full request + retry flow; a candidate that exhausts its own retry
+ * budget rotates past on its next failure.
  */
-async function contextWindowOf(ctx, provider, model) {
-  try {
-    const info = await ctx.llm.resolveModelInfo(provider, model);
-    const window = info?.context?.contextWindow;
-    return typeof window === 'number' && window > 0 ? window : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Rotate to the next model in list order.
- *
- * `requireLargerContext` is set for context-window overflows: compaction has
- * already tried and the same prompt still does not fit, so rotating onto a
- * model with the SAME (or unknown/smaller) window would only burn the cycle
- * budget on a request that cannot succeed either. In that mode a candidate is
- * accepted only when its window is strictly larger than the current route's.
- */
-async function rotateToNext(ctx, agent, currentIndex, requireLargerContext = false) {
+async function rotateToNext(ctx, agent, currentIndex) {
   const orderLength = config.order.length;
-  let currentWindow;
-  if (requireLargerContext && currentIndex >= 0) {
-    const current = config.order[currentIndex];
-    currentWindow = await contextWindowOf(ctx, current.provider, current.model);
-  }
-  let skippedSmaller = 0;
   for (let offset = 1; offset <= orderLength; offset += 1) {
     const row = config.order[(currentIndex + offset) % orderLength];
     const isSameRoute = currentIndex >= 0
       && row.provider === config.order[currentIndex].provider
       && row.model === config.order[currentIndex].model;
     if (isSameRoute) continue;
-    if (requireLargerContext && currentWindow !== undefined) {
-      const candidateWindow = await contextWindowOf(ctx, row.provider, row.model);
-      // Unknown capacity: allow it (the adapter simply does not publish one).
-      if (candidateWindow !== undefined && candidateWindow <= currentWindow) {
-        skippedSmaller += 1;
-        continue;
-      }
-    }
     try {
       const selection = await applySelection(ctx, agent, row);
       return { row, selection };
@@ -496,11 +462,6 @@ async function rotateToNext(ctx, agent, currentIndex, requireLargerContext = fal
         `[model-rotation] candidate ${row.provider}/${row.model} failed to install: ${String(error instanceof Error ? error.message : error).slice(0, 160)}`,
       );
     }
-  }
-  if (skippedSmaller > 0) {
-    ctx.logger?.warn?.(
-      `[model-rotation] context overflow: ${skippedSmaller} candidate(s) skipped for having no larger context window than ${currentWindow}`,
-    );
   }
   return undefined;
 }
@@ -523,11 +484,7 @@ function registerRecovery(ctx) {
       );
       return next();
     }
-    // A context-window overflow that reached this point already survived
-    // compaction's attempt: only a model with a strictly larger window can
-    // serve the same prompt, so constrain the candidates for that failure.
-    const overflow = (typeof failure?.code === 'string' ? failure.code.toUpperCase() : '') === 'CONTEXT_WINDOW_EXCEEDED';
-    const rotated = await rotateToNext(ctx, agent, currentIndex, overflow);
+    const rotated = await rotateToNext(ctx, agent, currentIndex);
     if (rotated === undefined) {
       ctx.logger?.warn?.('[model-rotation] no valid rotation candidate (all rejected by resolveCallConfig)');
       return next();
