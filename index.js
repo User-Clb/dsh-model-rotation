@@ -116,6 +116,25 @@ const MODEL_SIDE_TEXT = [
   /网络失败/,
   /代理连通/,
   /渠道网络/,
+  // Account state and credentials. A disabled/banned/expired account cannot
+  // serve the request from THIS route, but another provider (or another
+  // account behind it) in the rotation list usually can — the same reason the
+  // GUI reports "本轮运行失败账号已被禁用".
+  /账号.{0,8}(已被?)?(禁用|封禁|停用|冻结|注销|锁定)/,
+  /(已被?)?(禁用|封禁|冻结)的?账号/,
+  /账号.{0,6}(异常|不可用|失效|过期|掉线|欠费)/,
+  /(登录|登陆|凭据|凭证|令牌|授权|token|session).{0,8}(已)?(失效|过期|无效|被拒|被撤销|被吊销)/i,
+  /(需要?|请)重新(登录|登陆|授权|认证)/,
+  /未授权|无权限|无访问权限|鉴权失败|认证失败|授权失败|身份验证失败/,
+  /(api[ _-]?key|密钥|key).{0,10}(无效|失效|错误|不合法|被拒)/i,
+  /(invalid|expired|revoked|malformed).{0,16}(api[ _-]?key|token|credential|account|session)/i,
+  /(account|user).{0,16}(has been |was |is )?(disabled|suspended|banned|blocked|locked|deactivated)/i,
+  /unauthori[sz]ed|forbidden|permission denied|access denied/i,
+  // Model/route availability: the route itself cannot serve any request.
+  /模型.{0,6}(不可用|不存在|已下线|未找到|无权访问|已停用)/,
+  /(model|deployment).{0,12}(not found|does not exist|unavailable|decommissioned|retired)/i,
+  /(渠道|上游服务|服务|接口|响应).{0,4}(不可用|异常|故障|中断)/,
+  /并发(限制|超限)|请求(过于|太)频繁|频率(限制|超限)|too many requests/i,
 ];
 
 const DEFAULTS = Object.freeze({
@@ -371,8 +390,25 @@ function isModelSideFailure(failure) {
     if (code !== 'UNKNOWN') return true;
   }
   const text = typeof failure.message === 'string' ? failure.message : '';
+  // A user cancellation or a content-policy rejection is not a model outage,
+  // even when the envelope also mentions an account or a model.
+  if (NOT_MODEL_SIDE_TEXT.some((re) => re.test(text))) return false;
   return MODEL_SIDE_TEXT.some((re) => re.test(text));
 }
+
+/**
+ * Wording that must NOT rotate even though it mentions an account/model:
+ * the prompt is the problem, or the user asked for the stop. These are checked
+ * BEFORE the account/model rules so a legitimate cancellation or a content
+ * problem never burns the cycle budget.
+ */
+const NOT_MODEL_SIDE_TEXT = [
+  /用户(取消|中断|中止)/,
+  /(取消|停止)了?(本轮|请求|生成)/,
+  /you (cancelled|stopped|aborted)|request (was )?(cancelled|aborted)/i,
+  /内容(审核|安全|违规)|content (policy|filter|moderation)/i,
+  /上下文(压缩|整理)中/,
+];
 
 function findInOrder(selection) {
   if (selection === null || typeof selection !== 'object') return -1;
