@@ -131,6 +131,10 @@ const MODEL_SIDE_TEXT = [
   /账号.{0,6}(异常|不可用|失效|过期|掉线|欠费)/,
   /(登录|登陆|凭据|凭证|令牌|授权|token|session).{0,8}(已)?(失效|过期|无效|被拒|被撤销|被吊销)/i,
   /(需要?|请)重新(登录|登陆|授权|认证)/,
+  // preflight sign-in prompts thrown BEFORE dispatch (account adapter path)
+  /请先(登录|登陆|授权|认证)/,
+  /(登录|授权).{0,12}(并确认|后重试)/,
+  /sign[ _]?in (to|required)/i,
   /未授权|无权限|无访问权限|鉴权失败|认证失败|授权失败|身份验证失败/,
   /(api[ _-]?key|密钥|key).{0,10}(无效|失效|错误|不合法|被拒)/i,
   /(invalid|expired|revoked|malformed).{0,16}(api[ _-]?key|token|credential|account|session)/i,
@@ -607,6 +611,56 @@ function registerRecovery(ctx) {
 }
 
 /**
+ * Second recovery channel: errors thrown BEFORE the stream attempt starts
+ * (adapter preflight: account quota exhausted, sign-in required, credential
+ * rejection) bypass the agent/request-error waterfall entirely — the loop
+ * rethrows them out of step() and reports via the `agent/error` EMIT, which
+ * carries no recovery decision. "本轮运行失败当前请求的额度已用尽" is exactly
+ * this path (QUOTA remapped to ACCOUNT_QUOTA by the account adapter before
+ * dispatch).
+ *
+ * We cannot retry the dead turn from an emit, but we can do the next best
+ * thing: rotate the durable selection NOW, so the user's next message (or a
+ * manual resend) dispatches on a working model instead of the dead route.
+ * The cycle budget and per-session enablement gate this channel identically.
+ */
+function registerErrorWatch(ctx) {
+  ctx.on('agent/error', async (payload) => {
+    try {
+      const { agent, error } = payload ?? {};
+      if (agent === undefined) return;
+      const sessionId = agent.id;
+      if (!sessionEnabledFor(sessionId)) return;
+      const orderLength = config.order.length;
+      if (orderLength < 2) return;
+      // Rebuild the structured failure the classifier expects: LlmError keeps
+      // .code/.failure; plain errors fall back to message-wording detection.
+      const failure = error?.failure ?? {
+        code: typeof error?.code === 'string' ? error.code : 'UNKNOWN',
+        message: String(error?.message ?? error ?? ''),
+      };
+      if (!isModelSideFailure(failure)) return;
+      const current = durableSelection(ctx, agent);
+      const currentIndex = current === undefined ? -1 : findInOrder(current);
+      if (!cycleBudgetAvailable(sessionId, orderLength)) {
+        ctx.logger?.warn?.(
+          `[model-rotation] pre-stream failure for session ${sessionId} but the cycle budget is exhausted — route unchanged`,
+        );
+        return;
+      }
+      const rotated = await rotateToNext(ctx, agent, currentIndex);
+      if (rotated === undefined) return;
+      recordSwitch(sessionId);
+      ctx.logger?.warn?.(
+        `[model-rotation] pre-stream failure (${failure?.code ?? 'UNKNOWN'}: ${String(failure?.message ?? '').slice(0, 160)}) — turn lost, rotated route to ${rotated.selection.provider}/${rotated.selection.model} for the next request (session ${sessionId})`,
+      );
+    } catch {
+      /* the watch must never break the error reporting it observes */
+    }
+  });
+}
+
+/**
  * Per-model reasoning-effort compatibility cache. resolveModelInfo is cheap
  * per provider but not free; effort ids rarely change.
  */
@@ -1058,6 +1112,7 @@ export function apply(ctx) {
   persistConfig(config);
   ctx.logger?.info?.(`[model-rotation] config: ${JSON.stringify({ enabled: config.enabled, order: config.order.length, maxCycles: config.maxCycles })}`);
   registerRecovery(ctx);
+  registerErrorWatch(ctx);
   registerRouteOverride(ctx);
 
   ctx.inject(['connection'], (scope) => {
