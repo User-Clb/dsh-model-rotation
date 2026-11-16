@@ -60,7 +60,10 @@ const MODEL_SIDE_CODES = new Set([
   'AUTH',
   'MISSING_CREDENTIAL',
   'INVALID_CREDENTIAL',
-  'INVALID_REQUEST',
+  // INVALID_REQUEST removed: a 400 about the REQUEST (bad params, content policy,
+  // oversized body) is not a model outage — rotating through the list cannot fix
+  // the payload. Genuine model-side 400 envelopes (prompt-too-long, effort) are
+  // caught by the wording rules under their real codes instead.
   'PROTOCOL',
   'UNSUPPORTED_REASONING_EFFORT',
   'NO_ADAPTER',
@@ -79,7 +82,10 @@ const MODEL_SIDE_TEXT = [
   /quota/i,
   /temporarily set aside/,
   /soonest returns in/i,
-  /upstream/i,
+  // "upstream" ONLY with a failure noun — bare /upstream/i matched informational
+  // envelopes that merely mention an upstream and rotated away working models.
+  /上游(失败|异常|不可用|拒绝|故障|错误|超时)/,
+  /upstream (error|failure|failed|unavailable|rejected|busy|overloaded|timeout)/i,
   /temporarily (unavailable|overloaded)/i,
   /no available channel/i,
   /无可用渠道/,
@@ -129,7 +135,8 @@ const MODEL_SIDE_TEXT = [
   /(api[ _-]?key|密钥|key).{0,10}(无效|失效|错误|不合法|被拒)/i,
   /(invalid|expired|revoked|malformed).{0,16}(api[ _-]?key|token|credential|account|session)/i,
   /(account|user).{0,16}(has been |was |is )?(disabled|suspended|banned|blocked|locked|deactivated)/i,
-  /unauthori[sz]ed|forbidden|permission denied|access denied/i,
+  // bare "forbidden" is usually content-policy 403, not an outage: require 401/403 context
+  /unauthori[sz]ed|permission denied|access denied|401|403.{0,20}(key|token|account|access|forbidden)/i,
   // Model/route availability: the route itself cannot serve any request.
   /模型.{0,6}(不可用|不存在|已下线|未找到|无权访问|已停用)/,
   /(model|deployment).{0,12}(not found|does not exist|unavailable|decommissioned|retired)/i,
@@ -465,11 +472,74 @@ async function applySelection(ctx, agent, row) {
   const agentsController = controller?.agents;
   if (agentsController !== undefined && typeof agentsController.selectForNextRequest === 'function') {
     agentsController.selectForNextRequest(agent, selection);
-    return selection;
+  } else {
+    // Fallback (controller absent): durable event only — still better than nothing.
+    agent.session.append('model/selection', selection);
   }
-  // Fallback (controller absent): durable event only — still better than nothing.
-  agent.session.append('model/selection', selection);
+  // The new route starts with a FULL retry budget: the official llm-retry
+  // counter is keyed by [provider, policyKey], so a same-provider switch
+  // (rotation onto another workbuddy model, or a manual "use" during an
+  // in-flight retry) would otherwise inherit the OLD model's exhausted count
+  // and get judged dead after a single attempt. Appending retry:0 for every
+  // matching state key resets it — exactly what a fresh step/start does, but
+  // applied at switch time inside the current step.
+  resetProviderRetryBudget(ctx, agent, selection.provider);
   return selection;
+}
+
+/**
+ * Zero the llm-retry counters of one provider for this session by replaying
+ * the projection's own reset semantics: an llm/retry event with retry:0 and a
+ * fresh retryId for each [provider, policyKey] entry that still counts.
+ * Best-effort: an unreadable projection or a rejected append never blocks the
+ * selection itself (the switch is the important half).
+ */
+function resetProviderRetryBudget(ctx, agent, provider) {
+  try {
+    const state = ctx.sessionProjections.stateOf(agent.session, 'llmRetry');
+    if (state === null || state === undefined) return;
+    for (const [key, entry] of Object.entries(state)) {
+      let parsed;
+      try {
+        parsed = JSON.parse(key);
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(parsed) || parsed[0] !== provider) continue;
+      if (typeof entry?.retry !== 'number' || entry.retry <= 0) continue;
+      // The policyKey is itself a JSON array whose first element is the mode
+      // and (for normal mode) whose second element is maxRetries.
+      let mode = 'normal';
+      let maxRetries = 0;
+      try {
+        const inner = JSON.parse(parsed[1]);
+        if (Array.isArray(inner)) {
+          if (typeof inner[0] === 'string') mode = inner[0];
+          if (typeof inner[1] === 'number') maxRetries = inner[1];
+        }
+      } catch {
+        /* keep defaults */
+      }
+      try {
+        agent.session.append('llm/retry', {
+          retryId: `rotation-reset-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+          turn: 0,
+          step: 0,
+          provider,
+          mode,
+          policyKey: parsed[1],
+          retry: 0,
+          ...(mode === 'always' ? {} : { maxRetries }),
+          delayMs: 0,
+          failure: { code: 'ROTATION', message: `model rotation reset the retry budget for "${provider}"` },
+        });
+      } catch {
+        /* event rejected: the switch itself already succeeded */
+      }
+    }
+  } catch {
+    /* projection unavailable: nothing to reset */
+  }
 }
 
 /**
@@ -622,9 +692,16 @@ async function compatEffort(ctx, route) {
 function registerRouteOverride(ctx) {
   ctx.on('agent/request', async (payload, next) => {
     const resolved = await next();
-    if (!config.enabled) return compatEffort(ctx, resolved);
     const { agent } = payload ?? {};
-    if (agent === undefined) return compatEffort(ctx, resolved);
+    // The pending-pin applies ONLY to sessions with rotation enabled. Two
+    // bugs came from gating this on the GLOBAL flag: (a) a session enabled
+    // through sessionOverrides while the global default was off never pinned
+    // the route, so a manual "use" during an in-flight retry kept re-issuing
+    // the OLD model's step; (b) a session with rotation OFF got hijacked by a
+    // stale pending left over from another session's rotation history —
+    // "available models silently switched away". The effort compat shim stays
+    // global: it prevents a hard turn death for every route.
+    if (agent === undefined || !sessionEnabledFor(agent.id)) return compatEffort(ctx, resolved);
     const state = (() => {
       try {
         return ctx.sessionProjections.stateOf(agent.session, 'modelSelection');
