@@ -481,99 +481,18 @@ async function applySelection(ctx, agent, row) {
     agent.session.append('model/selection', selection);
   }
   // The new route starts with a FULL retry budget: the official llm-retry
-  // counter is keyed by [provider, policyKey], so a same-provider switch
-  // (rotation onto another workbuddy model, or a manual "use" during an
-  // in-flight retry) would otherwise inherit the OLD model's exhausted count
-  // and get judged dead after a single attempt. Appending retry:0 for every
-  // matching state key resets it — exactly what a fresh step/start does, but
-  // applied at switch time inside the current step.
-  resetProviderRetryBudget(ctx, agent, selection.provider);
+  // counter is keyed by [provider, policyKey], so a same-provider switch can
+  // inherit the OLD model's exhausted count. We deliberately DO NOT reset it
+  // by appending a synthetic llm/retry event: the replay validator for that
+  // event type requires coordinates matching the currently open turn/step,
+  // contiguous chain numbering, and a stable retryId — a fabricated retry:0
+  // event passes the runtime projection (which does not check coordinates)
+  // but corrupts the durable log so the WHOLE session history fails to load
+  // (observed in the field: 41 poisoned records, session unopenable).
+  // There is no legal event-driven budget reset under current kernel
+  // semantics. The kernel's own step/start event zeroes the retry state at
+  // the next step boundary, which is the correct (and only) reset path.
   return selection;
-}
-
-/**
- * Zero the llm-retry counters of one provider for this session by replaying
- * the projection's own reset semantics: an llm/retry event with retry:0 and a
- * fresh retryId for each [provider, policyKey] entry that still counts.
- * Best-effort: an unreadable projection or a rejected append never blocks the
- * selection itself (the switch is the important half).
- */
-function resetProviderRetryBudget(ctx, agent, provider) {
-  try {
-    const state = ctx.sessionProjections.stateOf(agent.session, 'llmRetry');
-    if (state === null || state === undefined) return;
-    for (const [key, entry] of Object.entries(state)) {
-      let parsed;
-      try {
-        parsed = JSON.parse(key);
-      } catch {
-        continue;
-      }
-      if (!Array.isArray(parsed) || parsed[0] !== provider) continue;
-      if (typeof entry?.retry !== 'number' || entry.retry <= 0) continue;
-      // The policyKey is itself a JSON array whose first element is the mode
-      // and (for normal mode) whose second element is maxRetries.
-      let mode = 'normal';
-      let maxRetries = 0;
-      try {
-        const inner = JSON.parse(parsed[1]);
-        if (Array.isArray(inner)) {
-          if (typeof inner[0] === 'string') mode = inner[0];
-          if (typeof inner[1] === 'number') maxRetries = inner[1];
-        }
-      } catch {
-        /* keep defaults */
-      }
-      try {
-        agent.session.append('llm/retry', {
-          retryId: `rotation-reset-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-          turn: 0,
-          step: 0,
-          provider,
-          mode,
-          policyKey: parsed[1],
-          retry: 0,
-          ...(mode === 'always' ? {} : { maxRetries }),
-          delayMs: 0,
-          failure: { code: 'ROTATION', message: `model rotation reset the retry budget for "${provider}"` },
-        });
-      } catch {
-        /* event rejected: the switch itself already succeeded */
-      }
-    }
-  } catch {
-    /* projection unavailable: nothing to reset */
-  }
-}
-
-/**
- * Rotate to the next model in list order. No candidate filtering: every model
- * gets the full request + retry flow; a candidate that exhausts its own retry
- * budget rotates past on its next failure.
- */
-/**
- * Rotate to the next model in list order. No candidate filtering: every model
- * gets the full request + retry flow; a candidate that exhausts its own retry
- * budget rotates past on its next failure.
- */
-async function rotateToNext(ctx, agent, currentIndex) {
-  const orderLength = config.order.length;
-  for (let offset = 1; offset <= orderLength; offset += 1) {
-    const row = config.order[(currentIndex + offset) % orderLength];
-    const isSameRoute = currentIndex >= 0
-      && row.provider === config.order[currentIndex].provider
-      && row.model === config.order[currentIndex].model;
-    if (isSameRoute) continue;
-    try {
-      const selection = await applySelection(ctx, agent, row);
-      return { row, selection };
-    } catch (error) {
-      ctx.logger?.warn?.(
-        `[model-rotation] candidate ${row.provider}/${row.model} failed to install: ${String(error instanceof Error ? error.message : error).slice(0, 160)}`,
-      );
-    }
-  }
-  return undefined;
 }
 
 function registerRecovery(ctx) {
