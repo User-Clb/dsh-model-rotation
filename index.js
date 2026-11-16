@@ -495,6 +495,31 @@ async function applySelection(ctx, agent, row) {
   return selection;
 }
 
+/**
+ * Rotate to the next model in list order. No candidate filtering: every model
+ * gets the full request + retry flow; a candidate that exhausts its own retry
+ * budget rotates past on its next failure.
+ */
+async function rotateToNext(ctx, agent, currentIndex) {
+  const orderLength = config.order.length;
+  for (let offset = 1; offset <= orderLength; offset += 1) {
+    const row = config.order[(currentIndex + offset) % orderLength];
+    const isSameRoute = currentIndex >= 0
+      && row.provider === config.order[currentIndex].provider
+      && row.model === config.order[currentIndex].model;
+    if (isSameRoute) continue;
+    try {
+      const selection = await applySelection(ctx, agent, row);
+      return { row, selection };
+    } catch (error) {
+      ctx.logger?.warn?.(
+        `[model-rotation] candidate ${row.provider}/${row.model} failed to install: ${String(error instanceof Error ? error.message : error).slice(0, 160)}`,
+      );
+    }
+  }
+  return undefined;
+}
+
 function registerRecovery(ctx) {
   ctx.on('agent/request-error', async (payload, next) => {
     const { agent, failure } = payload ?? {};
