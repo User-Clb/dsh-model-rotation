@@ -358,6 +358,14 @@ function setSessionEnabled(sessionId, enabled) {
  */
 function durableSelection(ctx, agent) {
   try {
+    // Kernel 0.2.x: AgentModel.current() IS the canonical read (recorded
+    // pending ?? lastUsed, else live route options). Prefer it over poking
+    // the projection directly.
+    const modelApi = agent.model;
+    if (typeof modelApi?.current === 'function') {
+      const current = modelApi.current();
+      if (current !== undefined && current !== null && current.provider && current.model) return current;
+    }
     const state = ctx.sessionProjections.stateOf(agent.session, 'modelSelection');
     const projected = state?.pending ?? state?.lastUsed;
     if (projected !== undefined && projected !== null) return projected;
@@ -384,8 +392,34 @@ function durableSelection(ctx, agent) {
  * (never parse message text when a stable code exists); wording catches
  * provider-specific envelopes like 429 soft_rate bodies.
  */
+/**
+ * Kernel/internal invariant failures: a structural contract violation inside
+ * the loop (frozen-route mismatch, a missing symbol, no route configured).
+ * These are NEVER a model outage — rotating cannot fix them and only burns
+ * the cycle budget re-throwing on the same broken route. Checked FIRST, before
+ * any code or wording rule, so an invariant message that happens to name a
+ * model or say "upstream" cannot accidentally trigger a rotation. Surfaced
+ * (next()) so the user sees the real cause instead of a silent model shuffle.
+ */
+const INTERNAL_INVARIANT_TEXT = [
+  /after step preparation fixed/i,
+  /use agent\.model\.select\(\) before step preparation/i,
+  /agent\/request proposed .* after step/i,
+  /is not defined\b.*rotateToNext|rotateToNext is not defined/i,
+  /has no provider\/model: set AgentOptions/i,
+  /\bReferenceError\b|\bTypeError\b.*agent\/request|step outside running phase|pre-step outside running phase/,
+];
+
+function isInternalInvariant(failure) {
+  if (failure === null || typeof failure !== 'object') return false;
+  const text = typeof failure.message === 'string' ? failure.message : '';
+  return INTERNAL_INVARIANT_TEXT.some((re) => re.test(text));
+}
+
 function isModelSideFailure(failure) {
   if (failure === null || typeof failure !== 'object') return false;
+  // Internal invariant errors are a distinct class: never model-side.
+  if (isInternalInvariant(failure)) return false;
   const code = typeof failure.code === 'string' ? failure.code.toUpperCase() : 'UNKNOWN';
   if (code === 'ABORTED') return false;
   if (code === 'IMAGE_OFFLOAD_REQUIRED') return false;
@@ -430,16 +464,19 @@ function findInOrder(selection) {
 
 
 /**
- * Install one model selection through the session-controller's official path
- * (selectForNextRequest): it appends the durable `model/selection` event AND
- * updates the controller's in-memory picked selection.
+ * Install one model selection through the kernel's official path
+ * (agent.model.select(), 0.2.x): it appends the durable `model/selection`
+ * event, which the projection folds and every later step preparation reads
+ * back through model.current().
  *
- * Writing only the durable event (the previous implementation) advanced the
- * projection while the controller's captured `picked` stayed on the FAILED
- * model — so prompt assembly kept reporting the old route, consumeSelection()
- * never matched the new header, and the very next assembly reverted to the
- * failed model. That is exactly the "rotated model doesn't actually work"
- * symptom: it rotated away again immediately.
+ * History of why the switch must go through the official durable path, never
+ * a raw append alone or an agent/request rewrite: (a) a raw append advanced
+ * the projection but left the OLD kernel's controller-side picked stale, so
+ * the next assembly reverted to the failed model ("rotated model doesn't
+ * actually work"); (b) an agent/request provider/model rewrite violated the
+ * 0.2.x per-step frozen-selection invariant and threw
+ * "agent/request proposed X after step preparation fixed Y". select() is the
+ * documented entry point and avoids both.
  *
  * NO liveness precheck here, by design: every candidate must go through the
  * complete failure-detection flow on its own — the official dsh-llm-retry
@@ -472,12 +509,20 @@ async function applySelection(ctx, agent, row) {
     model: row.model,
     ...(effort === undefined ? {} : { reasoningEffort: effort }),
   };
-  const controller = ctx.get?.('sessionController');
-  const agentsController = controller?.agents;
-  if (agentsController !== undefined && typeof agentsController.selectForNextRequest === 'function') {
-    agentsController.selectForNextRequest(agent, selection);
+  // Kernel 0.2.x contract: the official switch API is agent.model.select()
+  // (AgentModel in @deepseek-ai/dsh-agent): it dedups against the recorded
+  // selection and appends the same durable `model/selection` event. The
+  // session-controller's selectForNextRequest/consumeSelection facade existed
+  // only in the previous kernel and is GONE — calling it silently fell into
+  // the append fallback while nothing updated the step-fixed route, and the
+  // old agent/request pin then fought the kernel's new per-step frozen
+  // selection invariant ("agent/request proposed X after step preparation
+  // fixed Y; use agent.model.select() before step preparation"). Use the
+  // documented entry point so the NEXT step prepares on the new route.
+  if (typeof agent.model?.select === 'function') {
+    agent.model.select(selection);
   } else {
-    // Fallback (controller absent): durable event only — still better than nothing.
+    // Fallback (older kernel without AgentModel): the raw durable event.
     agent.session.append('model/selection', selection);
   }
   // The new route starts with a FULL retry budget: the official llm-retry
@@ -547,11 +592,70 @@ function registerRecovery(ctx) {
     ctx.logger?.warn?.(
       `[model-rotation] model failure (${failure?.code ?? 'UNKNOWN'}: ${String(failure?.message ?? '').slice(0, 160)}) — rotated to ${rotated.selection.provider}/${rotated.selection.model} (step ${payload.turn}/${payload.step})`,
     );
-    // Instruct the loop to re-run the failed step; the loop re-enters
-    // prepareRequest(), whose agent/request waterfall re-resolves the route —
-    // and the controller's in-memory selection now matches the durable one.
-    return { kind: 'retry' };
+    // Kernel 0.2.x freezes the step's route in decision.selection, and the
+    // agent/request waterfall is FORBIDDEN to change it (that check is what
+    // produced "agent/request proposed X after step preparation fixed Y").
+    // A returned retry therefore only re-runs on the NEW route if the frozen
+    // selection object itself carries it. preStep passes modelSelection into
+    // agent/pre-step and reuses that exact object for every attempt of the
+    // step, so we mutate the captured one (identity- and position-checked) —
+    // the only legal in-step switch. When no trustworthy capture exists we
+    // still keep the durable rotation and let the failure surface: the next
+    // step or message starts on the working model instead of burning the
+    // cycle budget re-throwing on a dead route.
+    if (applyStepRouteSwap(agent, payload.turn, payload.step, rotated.selection)) {
+      return { kind: 'retry' };
+    }
+    ctx.logger?.warn?.(
+      `[model-rotation] no step-scoped selection capture for step ${payload.turn}/${payload.step} — route rotated for the next step; surfacing this failure instead of retrying a frozen dead route`,
+    );
+    return next();
   });
+}
+
+/**
+ * Step-scoped selection capture. agent/pre-step receives the very object the
+ * loop re-reads for every attempt of that step (preStep: `const selection =
+ * this.model.current()` → payload.modelSelection → decision.selection). We
+ * remember it per agent with its turn/step so a rotation can mutate it in
+ * place — the only way an in-step retry can leave the dead route.
+ */
+const stepSelections = new WeakMap(); // agent → { turn, step, selection }
+
+function captureStepSelection(agent, payload) {
+  try {
+    const selection = payload?.modelSelection;
+    if (agent === undefined || selection === null || typeof selection !== 'object') return;
+    stepSelections.set(agent, {
+      turn: payload.turn,
+      step: payload.step,
+      selection,
+    });
+  } catch {
+    /* capture is best-effort */
+  }
+}
+
+/**
+ * Swap the frozen step selection to the rotated route. Returns true only when
+ * a capture for THIS exact turn/step exists and the mutation landed — the
+ * caller uses that to decide between retry and surfacing.
+ */
+function applyStepRouteSwap(agent, turn, step, selection) {
+  try {
+    const captured = stepSelections.get(agent);
+    if (captured === undefined) return false;
+    if (captured.turn !== turn || captured.step !== step) return false;
+    const target = captured.selection;
+    if (target === null || typeof target !== 'object') return false;
+    target.provider = selection.provider;
+    target.model = selection.model;
+    if (selection.reasoningEffort === undefined) delete target.reasoningEffort;
+    else target.reasoningEffort = selection.reasoningEffort;
+    return target.provider === selection.provider && target.model === selection.model;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -583,6 +687,15 @@ function registerErrorWatch(ctx) {
         code: typeof error?.code === 'string' ? error.code : 'UNKNOWN',
         message: String(error?.message ?? error ?? ''),
       };
+      // A kernel invariant violation (frozen-route mismatch, missing symbol,
+      // no route) is detected and logged here but NEVER rotated: it is a
+      // structural bug, and rotating re-throws on the same broken route.
+      if (isInternalInvariant(failure)) {
+        ctx.logger?.warn?.(
+          `[model-rotation] kernel invariant failure detected (not a model outage, no rotation): ${String(failure.message ?? '').slice(0, 200)}`,
+        );
+        return;
+      }
       if (!isModelSideFailure(failure)) return;
       const current = durableSelection(ctx, agent);
       const currentIndex = current === undefined ? -1 : findInOrder(current);
@@ -634,50 +747,7 @@ async function supportedEfforts(ctx, provider, model) {
   return result;
 }
 
-/**
- * Rewrite one proposed request config so its reasoningEffort is compatible
- * with the target model: unsupported effort → adapter default; effort on a
- * non-reasoning model → stripped. This runs in the agent/request waterfall —
- * BEFORE prepareCall validates — so "does not support reasoning effort" never
- * kills the turn. Without this, an effort mismatch thrown in prepareRequest
- * bypasses the agent/request-error waterfall entirely (no retry, no rotation,
- * turn dies) — the reported "本轮运行失败 … does not support reasoning effort
- * 'on'/'high'" symptom.
- */
-async function compatEffort(ctx, route) {
-  if (route.reasoningEffort === undefined) return route;
-  const supported = await supportedEfforts(ctx, route.provider, route.model);
-  if (supported === 'unknown') return route;
-  if (supported.has(route.reasoningEffort)) return route;
-  if (supported.size === 0) {
-    // Non-reasoning model: drop the effort entirely.
-    const { reasoningEffort: _dropped, ...stripped } = route;
-    ctx.logger?.warn?.(
-      `[model-rotation] effort "${route.reasoningEffort}" not supported by ${route.provider}/${route.model} (non-reasoning) — stripped`,
-    );
-    return stripped;
-  }
-  try {
-    const info = await ctx.llm.resolveModelInfo(route.provider, route.model);
-    const defaultEffort = info?.reasoning?.defaultEffort;
-    if (defaultEffort !== undefined && supported.has(defaultEffort)) {
-      ctx.logger?.warn?.(
-        `[model-rotation] effort "${route.reasoningEffort}" not supported by ${route.provider}/${route.model} — degraded to adapter default "${defaultEffort}"`,
-      );
-      return { ...route, reasoningEffort: defaultEffort };
-    }
-  } catch {
-    /* fall through */
-  }
-  const first = supported.values().next();
-  if (!first.done) {
-    ctx.logger?.warn?.(
-      `[model-rotation] effort "${route.reasoningEffort}" not supported by ${route.provider}/${route.model} — degraded to "${first.value}"`,
-    );
-    return { ...route, reasoningEffort: first.value };
-  }
-  return route;
-}
+
 
 /**
  * Pin the newest durable selection onto every request the loop builds. The
@@ -687,38 +757,67 @@ async function compatEffort(ctx, route) {
  * the reasoning effort of whatever route wins (rotated or hand-picked) so
  * effort-incompatible models degrade instead of failing the turn.
  */
-function registerRouteOverride(ctx) {
-  ctx.on('agent/request', async (payload, next) => {
-    const resolved = await next();
-    const { agent } = payload ?? {};
-    // The pending-pin applies ONLY to sessions with rotation enabled. Two
-    // bugs came from gating this on the GLOBAL flag: (a) a session enabled
-    // through sessionOverrides while the global default was off never pinned
-    // the route, so a manual "use" during an in-flight retry kept re-issuing
-    // the OLD model's step; (b) a session with rotation OFF got hijacked by a
-    // stale pending left over from another session's rotation history —
-    // "available models silently switched away". The effort compat shim stays
-    // global: it prevents a hard turn death for every route.
-    if (agent === undefined || !sessionEnabledFor(agent.id)) return compatEffort(ctx, resolved);
-    const state = (() => {
-      try {
-        return ctx.sessionProjections.stateOf(agent.session, 'modelSelection');
-      } catch {
-        return undefined;
+/**
+ * Kernel 0.2.x route contract (read from dsh-agent-loop source):
+ *   - preStep reads agent.model.current() ONCE and freezes it into
+ *     decision.selection; every attempt of that step reuses it.
+ *   - the agent/request waterfall is FORBIDDEN to change provider/model, and
+ *     separately forbidden to change reasoningEffort. A violation throws
+ *     `agent/request proposed "X/Y" after step preparation fixed "A/B"; use
+ *     agent.model.select() before step preparation` and kills the turn.
+ *
+ * The previous agent/request listener (pending-pin + effort compat rewrite)
+ * was exactly that violation — it is why available models died with this
+ * error. It is removed. Route and effort changes are now recorded through the
+ * documented entry point agent.model.select(), which takes effect at the NEXT
+ * step preparation (the only legal timing).
+ */
+function registerSelectionHygiene(ctx) {
+  // Fix an unsupported recorded effort BEFORE the step freezes it: append a
+  // corrected selection via agent.model.select() during pre-step, so the next
+  // step prepares on a compatible route instead of dying in prepareCall.
+  ctx.on('agent/pre-step', async (payload, next) => {
+    const decision = await next();
+    try {
+      const { agent, modelSelection } = payload ?? {};
+      // Capture the frozen step selection FIRST: model.current() returns a
+      // fresh shallow copy at preStep, and preStep reuses that exact object as
+      // decision.selection for every attempt of this step. Remembering it lets
+      // a later rotation mutate the route in place (applyStepRouteSwap).
+      captureStepSelection(agent, payload);
+      if (agent === undefined || modelSelection === null || typeof modelSelection !== 'object') return decision;
+      if (modelSelection.reasoningEffort === undefined) return decision;
+      const supported = await supportedEfforts(ctx, modelSelection.provider, modelSelection.model);
+      if (supported === 'unknown' || supported.has(modelSelection.reasoningEffort)) return decision;
+      let fallback;
+      if (supported.size === 0) fallback = undefined; // non-reasoning model: strip effort
+      else {
+        fallback = supported.values().next().value;
+        try {
+          const info = await ctx.llm.resolveModelInfo(modelSelection.provider, modelSelection.model);
+          if (info?.reasoning?.defaultEffort !== undefined && supported.has(info.reasoning.defaultEffort)) {
+            fallback = info.reasoning.defaultEffort;
+          }
+        } catch { /* use first supported */ }
       }
-    })();
-    const pending = state?.pending;
-    let route = resolved;
-    if (pending !== null && pending !== undefined
-      && (pending.provider !== resolved.provider || pending.model !== resolved.model)) {
-      route = {
-        ...resolved,
-        provider: pending.provider,
-        model: pending.model,
-        ...(pending.reasoningEffort === undefined ? {} : { reasoningEffort: pending.reasoningEffort }),
-      };
+      ctx.logger?.warn?.(
+        `[model-rotation] effort "${modelSelection.reasoningEffort}" unsupported by ${modelSelection.provider}/${modelSelection.model} — corrected to ${fallback ?? '(none)'}`,
+      );
+      // Fix the CURRENT step's frozen copy in place (so prepareCall does not
+      // throw UNSUPPORTED_REASONING_EFFORT on this attempt), then record the
+      // corrected selection durably for subsequent steps via the official API.
+      if (fallback === undefined) delete modelSelection.reasoningEffort;
+      else modelSelection.reasoningEffort = fallback;
+      if (typeof agent.model?.select === 'function') {
+        const durable = fallback === undefined
+          ? { provider: modelSelection.provider, model: modelSelection.model }
+          : { provider: modelSelection.provider, model: modelSelection.model, reasoningEffort: fallback };
+        agent.model.select(durable);
+      }
+    } catch {
+      /* hygiene must never break the step */
     }
-    return compatEffort(ctx, route);
+    return decision;
   });
 }
 
@@ -857,6 +956,11 @@ function currentSelectionFor(sessionId) {
     const agents = ctx.get?.('agents');
     const agent = typeof sessionId === 'string' && agents !== undefined ? agents.get(sessionId) : undefined;
     if (agent === undefined) return { current: null };
+    const modelApi = agent.model;
+    if (typeof modelApi?.current === 'function') {
+      const current = modelApi.current();
+      if (current !== undefined && current !== null && current.provider && current.model) return { current };
+    }
     const state = ctx.sessionProjections.stateOf(agent.session, 'modelSelection');
     const projected = state?.pending ?? state?.lastUsed;
     if (projected !== undefined && projected !== null) return { current: projected };
@@ -1057,7 +1161,7 @@ export function apply(ctx) {
   ctx.logger?.info?.(`[model-rotation] config: ${JSON.stringify({ enabled: config.enabled, order: config.order.length, maxCycles: config.maxCycles })}`);
   registerRecovery(ctx);
   registerErrorWatch(ctx);
-  registerRouteOverride(ctx);
+  registerSelectionHygiene(ctx);
 
   ctx.inject(['connection'], (scope) => {
     scope.effect(() => {
